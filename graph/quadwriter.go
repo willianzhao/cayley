@@ -26,7 +26,8 @@ import (
 	"errors"
 	"io"
 
-	"github.com/cayleygraph/cayley/quad"
+	"github.com/cayleygraph/cayley/graph/iterator"
+	"github.com/cayleygraph/quad"
 )
 
 type Procedure int8
@@ -190,7 +191,6 @@ func WriterMethods() []string {
 
 type BatchWriter interface {
 	quad.WriteCloser
-	quad.BatchWriter
 	Flush() error
 }
 
@@ -261,6 +261,15 @@ func (w *txWriter) WriteQuad(q quad.Quad) error {
 	return nil
 }
 
+func (w *txWriter) WriteQuads(buf []quad.Quad) (int, error) {
+	for i, q := range buf {
+		if err := w.WriteQuad(q); err != nil {
+			return i, err
+		}
+	}
+	return len(buf), nil
+}
+
 // NewRemover creates a quad writer for a given QuadStore which removes quads instead of adding them.
 func NewRemover(qs QuadWriter) BatchWriter {
 	return &removeWriter{qs: qs}
@@ -288,7 +297,7 @@ func (w *removeWriter) Flush() error {
 }
 func (w *removeWriter) Close() error { return nil }
 
-// NewResultReader creates a quad reader for a given QuadStore.
+// NewQuadStoreReader creates a quad reader for a given QuadStore.
 func NewQuadStoreReader(qs QuadStore) quad.ReadSkipCloser {
 	return NewResultReader(qs, nil)
 }
@@ -299,16 +308,16 @@ func NewQuadStoreReader(qs QuadStore) quad.ReadSkipCloser {
 // Only quads returned by iterator's Result will be used.
 //
 // Iterator will be closed with the reader.
-func NewResultReader(qs QuadStore, it Iterator) quad.ReadSkipCloser {
+func NewResultReader(qs QuadStore, it iterator.Scanner) quad.ReadSkipCloser {
 	if it == nil {
-		it = qs.QuadsAllIterator()
+		it = qs.QuadsAllIterator().Iterate()
 	}
 	return &quadReader{qs: qs, it: it}
 }
 
 type quadReader struct {
 	qs QuadStore
-	it Iterator
+	it iterator.Scanner
 }
 
 func (r *quadReader) ReadQuad() (quad.Quad, error) {

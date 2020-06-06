@@ -19,54 +19,36 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/cayleygraph/cayley/graph"
-	"github.com/cayleygraph/cayley/graph/graphmock"
+	"github.com/stretchr/testify/require"
+
 	. "github.com/cayleygraph/cayley/graph/iterator"
+	"github.com/cayleygraph/cayley/graph/refs"
 )
 
 // Make sure that tags work on the And.
-func TestTag(t *testing.T) {
+func TestAndTag(t *testing.T) {
 	ctx := context.TODO()
-	qs := &graphmock.Oldstore{
-		Data: []string{},
-		Iter: NewFixed(),
-	}
 	fix1 := NewFixed(Int64Node(234))
-	fix1.Tagger().Add("foo")
-	and := NewAnd(qs, fix1)
-	and.Tagger().Add("bar")
-	out := fix1.Tagger().Tags()
-	if len(out) != 1 {
-		t.Errorf("Expected length 1, got %d", len(out))
-	}
-	if out[0] != "foo" {
-		t.Errorf("Cannot get tag back, got %s", out[0])
-	}
+	fix2 := NewFixed(Int64Node(234))
+	var ands Shape = NewAnd(Tag(fix1, "foo")).AddOptionalIterator(Tag(fix2, "baz"))
+	ands = Tag(ands, "bar")
 
-	if !and.Next(ctx) {
-		t.Errorf("And did not next")
-	}
-	val := and.Result()
-	if val.(Int64Node) != 234 {
-		t.Errorf("Unexpected value")
-	}
-	tags := make(map[string]graph.Value)
+	and := ands.Iterate()
+	require.True(t, and.Next(ctx))
+	require.Equal(t, Int64Node(234), and.Result())
+
+	tags := make(map[string]refs.Ref)
 	and.TagResults(tags)
-	if tags["bar"].(Int64Node) != 234 {
-		t.Errorf("no bar tag")
-	}
-	if tags["foo"].(Int64Node) != 234 {
-		t.Errorf("no foo tag")
-	}
+	require.Equal(t, map[string]refs.Ref{
+		"foo": Int64Node(234),
+		"bar": Int64Node(234),
+		"baz": Int64Node(234),
+	}, tags)
 }
 
 // Do a simple itersection of fixed values.
 func TestAndAndFixedIterators(t *testing.T) {
 	ctx := context.TODO()
-	qs := &graphmock.Oldstore{
-		Data: []string{},
-		Iter: NewFixed(),
-	}
 	fix1 := NewFixed(
 		Int64Node(1),
 		Int64Node(2),
@@ -78,38 +60,30 @@ func TestAndAndFixedIterators(t *testing.T) {
 		Int64Node(4),
 		Int64Node(5),
 	)
-	and := NewAnd(qs, fix1, fix2)
+	ands := NewAnd(fix1, fix2)
 	// Should be as big as smallest subiterator
-	size, accurate := and.Size()
-	if size != 3 {
-		t.Error("Incorrect size")
-	}
-	if !accurate {
-		t.Error("not accurate")
-	}
+	st, err := ands.Stats(ctx)
+	require.NoError(t, err)
+	require.Equal(t, refs.Size{
+		Value: 3,
+		Exact: true,
+	}, st.Size)
 
-	if !and.Next(ctx) || and.Result().(Int64Node) != 3 {
-		t.Error("Incorrect first value")
-	}
+	and := ands.Iterate()
 
-	if !and.Next(ctx) || and.Result().(Int64Node) != 4 {
-		t.Error("Incorrect second value")
-	}
+	require.True(t, and.Next(ctx))
+	require.Equal(t, Int64Node(3), and.Result())
 
-	if and.Next(ctx) {
-		t.Error("Too many values")
-	}
+	require.True(t, and.Next(ctx))
+	require.Equal(t, Int64Node(4), and.Result())
 
+	require.False(t, and.Next(ctx))
 }
 
 // If there's no intersection, the size should still report the same,
 // but there should be nothing to Next()
 func TestNonOverlappingFixedIterators(t *testing.T) {
 	ctx := context.TODO()
-	qs := &graphmock.Oldstore{
-		Data: []string{},
-		Iter: NewFixed(),
-	}
 	fix1 := NewFixed(
 		Int64Node(1),
 		Int64Node(2),
@@ -121,63 +95,44 @@ func TestNonOverlappingFixedIterators(t *testing.T) {
 		Int64Node(6),
 		Int64Node(7),
 	)
-	and := NewAnd(qs, fix1, fix2)
+	ands := NewAnd(fix1, fix2)
 	// Should be as big as smallest subiterator
-	size, accurate := and.Size()
-	if size != 3 {
-		t.Error("Incorrect size")
-	}
-	if !accurate {
-		t.Error("not accurate")
-	}
+	st, err := ands.Stats(ctx)
+	require.NoError(t, err)
+	require.Equal(t, refs.Size{
+		Value: 3,
+		Exact: true,
+	}, st.Size)
 
-	if and.Next(ctx) {
-		t.Error("Too many values")
-	}
-
+	and := ands.Iterate()
+	require.False(t, and.Next(ctx))
 }
 
 func TestAllIterators(t *testing.T) {
 	ctx := context.TODO()
-	qs := &graphmock.Oldstore{
-		Data: []string{},
-		Iter: NewFixed(),
-	}
-	all1 := NewInt64(1, 5, true)
-	all2 := NewInt64(4, 10, true)
-	and := NewAnd(qs, all2, all1)
+	all1 := newInt64(1, 5, true)
+	all2 := newInt64(4, 10, true)
+	and := NewAnd(all2, all1).Iterate()
 
-	if !and.Next(ctx) || and.Result().(Int64Node) != Int64Node(4) {
-		t.Error("Incorrect first value")
-	}
+	require.True(t, and.Next(ctx))
+	require.Equal(t, Int64Node(4), and.Result())
 
-	if !and.Next(ctx) || and.Result().(Int64Node) != Int64Node(5) {
-		t.Error("Incorrect second value")
-	}
+	require.True(t, and.Next(ctx))
+	require.Equal(t, Int64Node(5), and.Result())
 
-	if and.Next(ctx) {
-		t.Error("Too many values")
-	}
+	require.False(t, and.Next(ctx))
 }
 
 func TestAndIteratorErr(t *testing.T) {
 	ctx := context.TODO()
-	qs := &graphmock.Oldstore{
-		Data: []string{},
-		Iter: NewFixed(),
-	}
 	wantErr := errors.New("unique")
 	allErr := newTestIterator(false, wantErr)
 
-	and := NewAnd(qs,
+	and := NewAnd(
 		allErr,
-		NewInt64(1, 5, true),
-	)
+		newInt64(1, 5, true),
+	).Iterate()
 
-	if and.Next(ctx) != false {
-		t.Errorf("And iterator did not pass through initial 'false'")
-	}
-	if and.Err() != wantErr {
-		t.Errorf("And iterator did not pass through underlying Err")
-	}
+	require.False(t, and.Next(ctx))
+	require.Equal(t, wantErr, and.Err())
 }

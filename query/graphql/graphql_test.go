@@ -12,8 +12,8 @@ import (
 
 	"github.com/cayleygraph/cayley/graph/graphtest/testutil"
 	"github.com/cayleygraph/cayley/graph/memstore"
-	"github.com/cayleygraph/cayley/quad"
-	"github.com/cayleygraph/cayley/voc/rdf"
+	"github.com/cayleygraph/quad"
+	"github.com/cayleygraph/quad/voc/rdf"
 )
 
 func iris(arr ...string) (out []quad.Value) {
@@ -29,7 +29,7 @@ var casesParse = []struct {
 }{
 	{
 		`{
-	user(id: 3500401, http://iri: http://some_iri, follow: <bob>, n: _:bob) @rev(follow: "123"){
+	user(id: 3500401, http://iri: http://some_iri, follow: <bob>, n: _:bob, v: ["<bob>", "name", 3]) @rev(follow: "123"){
 	id: ` + ValueKey + `,
 	type: ` + rdf.NS + "type" + `,
 	followed: follow @reverse @label(v: <fb>) {
@@ -54,6 +54,7 @@ var casesParse = []struct {
 				{"http://iri", false, iris("http://some_iri"), nil},
 				{"follow", false, iris("bob"), nil},
 				{"n", false, []quad.Value{quad.BNode("bob")}, nil},
+				{"v", false, []quad.Value{quad.IRI("bob"), quad.String("name"), quad.Int(3)}, nil},
 			},
 			Fields: []field{
 				{Via: quad.IRI(ValueKey), Alias: "id"},
@@ -94,10 +95,12 @@ func TestParse(t *testing.T) {
 	}
 }
 
+type M = map[string]interface{}
+
 var casesExecute = []struct {
 	name   string
 	query  string
-	result map[string]interface{}
+	result M
 }{
 	{
 		"cool people and friends",
@@ -113,20 +116,20 @@ var casesExecute = []struct {
     }
   }
 }`,
-		map[string]interface{}{
-			"me": []map[string]interface{}{
+		M{
+			"me": []M{
 				{
 					"id":      quad.IRI("bob"),
 					"follows": nil,
-					"followed": []map[string]interface{}{
+					"followed": []M{
 						{ValueKey: quad.IRI("alice")},
-						{ValueKey: quad.IRI("charlie")},
 						{ValueKey: quad.IRI("dani")},
+						{ValueKey: quad.IRI("charlie")},
 					},
 				},
 				{
 					"id": quad.IRI("dani"),
-					"follows": []map[string]interface{}{
+					"follows": []M{
 						{
 							ValueKey: quad.IRI("bob"),
 							"status": quad.String("cool_person"),
@@ -139,14 +142,14 @@ var casesExecute = []struct {
 							},
 						},
 					},
-					"followed": map[string]interface{}{
+					"followed": M{
 						ValueKey: quad.IRI("charlie"),
 					},
 				},
 				{
 					"id":      quad.IRI("greg"),
 					"follows": nil,
-					"followed": []map[string]interface{}{
+					"followed": []M{
 						{ValueKey: quad.IRI("dani")},
 						{ValueKey: quad.IRI("fred")},
 					},
@@ -164,10 +167,10 @@ var casesExecute = []struct {
     }
   }
 }`,
-		map[string]interface{}{
-			"me": map[string]interface{}{
+		M{
+			"me": M{
 				"id": quad.IRI("dani"),
-				"follows": map[string]interface{}{
+				"follows": M{
 					ValueKey: quad.IRI("bob"),
 				},
 			},
@@ -181,8 +184,8 @@ var casesExecute = []struct {
     status @label(v: <smart_graph>)
   }
 }`,
-		map[string]interface{}{
-			"me": []map[string]interface{}{
+		M{
+			"me": []M{
 				{
 					"id":     quad.IRI("emily"),
 					"status": quad.String("smart_person"),
@@ -203,12 +206,12 @@ var casesExecute = []struct {
     follows {*}
   }
 }`,
-		map[string]interface{}{
-			"me": []map[string]interface{}{
+		M{
+			"me": []M{
 				{
 					"id":     quad.IRI("emily"),
 					"status": quad.String("smart_person"),
-					"follows": map[string]interface{}{
+					"follows": M{
 						"id":      quad.IRI("fred"),
 						"follows": quad.IRI("greg"),
 					},
@@ -235,8 +238,8 @@ var casesExecute = []struct {
     }
   }
 }`,
-		map[string]interface{}{
-			"me": map[string]interface{}{
+		M{
+			"me": M{
 				"id":     quad.IRI("fred"),
 				"fof":    quad.IRI("dani"),
 				"friend": quad.IRI("greg"),
@@ -247,9 +250,56 @@ var casesExecute = []struct {
 			},
 		},
 	},
+	{
+		"unnest object (non existent)",
+		`{
+  me(id: fred) {
+    id: ` + ValueKey + `
+    follows_missing @unnest {
+      friend: ` + ValueKey + `
+      friend_status: status
+    }
+  }
+}`,
+		M{
+			"me": M{
+				"id": quad.IRI("fred"),
+			},
+		},
+	},
+	{
+		"all optional",
+		`{
+  nodes {
+    id,
+    status @opt
+  }
+}`,
+		M{
+			"nodes": []M{
+				{"id": quad.IRI("alice")},
+				{"id": quad.IRI("follows")},
+				{"id": quad.IRI("bob"), "status": quad.String("cool_person")},
+				{"id": quad.IRI("fred")},
+				{"id": quad.IRI("status")},
+				{"id": quad.String("cool_person")},
+				{"id": quad.IRI("dani"), "status": quad.String("cool_person")},
+				{"id": quad.IRI("charlie")},
+				{"id": quad.IRI("greg"), "status": []quad.Value{
+					quad.String("cool_person"),
+					quad.String("smart_person"),
+				}},
+				{"id": quad.IRI("emily"), "status": quad.String("smart_person")},
+				{"id": quad.IRI("predicates")},
+				{"id": quad.IRI("are")},
+				{"id": quad.String("smart_person")},
+				{"id": quad.IRI("smart_graph")},
+			},
+		},
+	},
 }
 
-func toJson(o interface{}) string {
+func toJSON(o interface{}) string {
 	buf := bytes.NewBuffer(nil)
 	json.NewEncoder(buf).Encode(o)
 	buf2 := bytes.NewBuffer(nil)
@@ -270,7 +320,7 @@ func TestExecute(t *testing.T) {
 			require.NoError(t, err)
 			out, err := q.Execute(context.Background(), qs)
 			require.NoError(t, err)
-			require.Equal(t, c.result, out, "results:\n%v\n\nvs\n\n%v", toJson(c.result), toJson(out))
+			require.Equal(t, c.result, out, "results:\n%v\n\nvs\n\n%v", toJSON(c.result), toJSON(out))
 		})
 	}
 }

@@ -8,18 +8,19 @@ import (
 	"github.com/cayleygraph/cayley/graph/graphtest"
 	"github.com/cayleygraph/cayley/graph/graphtest/testutil"
 	"github.com/cayleygraph/cayley/graph/sql"
-	"github.com/cayleygraph/cayley/quad"
+	"github.com/cayleygraph/quad"
 	"github.com/stretchr/testify/require"
 )
 
 type Config struct {
 	TimeRound bool
+	TimeInMcs bool
 }
 
 func (c Config) quadStore() *graphtest.Config {
 	return &graphtest.Config{
 		NoPrimitives:        true,
-		TimeInMcs:           true,
+		TimeInMcs:           c.TimeInMcs,
 		TimeRound:           c.TimeRound,
 		OptimizesComparison: true,
 	}
@@ -27,7 +28,7 @@ func (c Config) quadStore() *graphtest.Config {
 
 func TestAll(t *testing.T, typ string, fnc DatabaseFunc, c *Config) {
 	if c == nil {
-		c = &Config{}
+		c = &Config{TimeInMcs: true}
 	}
 	create := makeDatabaseFunc(typ, fnc)
 	t.Run("qs", func(t *testing.T) {

@@ -2,10 +2,11 @@ package cayley
 
 import (
 	"github.com/cayleygraph/cayley/graph"
+	"github.com/cayleygraph/cayley/graph/iterator"
 	_ "github.com/cayleygraph/cayley/graph/memstore"
-	"github.com/cayleygraph/cayley/graph/path"
-	"github.com/cayleygraph/cayley/quad"
+	"github.com/cayleygraph/cayley/query/path"
 	_ "github.com/cayleygraph/cayley/writer"
+	"github.com/cayleygraph/quad"
 )
 
 var (
@@ -14,6 +15,23 @@ var (
 
 	NewTransaction = graph.NewTransaction
 )
+
+type Iterator = iterator.Shape
+type QuadStore = graph.QuadStore
+type QuadWriter = graph.QuadWriter
+
+type Path = path.Path
+
+type Handle struct {
+	graph.QuadStore
+	graph.QuadWriter
+}
+
+func (h *Handle) Close() error {
+	err := h.QuadWriter.Close()
+	h.QuadStore.Close()
+	return err
+}
 
 func Triple(subject, predicate, object interface{}) quad.Quad {
 	return Quad(subject, predicate, object, nil)

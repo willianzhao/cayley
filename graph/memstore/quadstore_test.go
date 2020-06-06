@@ -20,12 +20,15 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/cayleygraph/cayley/graph"
 	"github.com/cayleygraph/cayley/graph/graphtest"
 	"github.com/cayleygraph/cayley/graph/iterator"
-	"github.com/cayleygraph/cayley/quad"
+	"github.com/cayleygraph/cayley/graph/refs"
+	"github.com/cayleygraph/cayley/query/shape"
 	"github.com/cayleygraph/cayley/writer"
-	"github.com/stretchr/testify/require"
+	"github.com/cayleygraph/quad"
 )
 
 // This is a simple test graph.
@@ -87,6 +90,14 @@ func TestMemstore(t *testing.T) {
 	})
 }
 
+func BenchmarkMemstore(b *testing.B) {
+	graphtest.BenchmarkAll(b, func(t testing.TB) (graph.QuadStore, graph.Options, func()) {
+		return New(), nil, func() {}
+	}, &graphtest.Config{
+		AlwaysRunIntegration: true,
+	})
+}
+
 type pair struct {
 	query string
 	value int64
@@ -94,7 +105,13 @@ type pair struct {
 
 func TestMemstoreValueOf(t *testing.T) {
 	qs, _, index := makeTestStore(simpleGraph)
-	require.Equal(t, int64(22), qs.Size())
+	exp := graph.Stats{
+		Nodes: refs.Size{Value: 11, Exact: true},
+		Quads: refs.Size{Value: 11, Exact: true},
+	}
+	st, err := qs.Stats(context.Background(), true)
+	require.NoError(t, err)
+	require.Equal(t, exp, st, "Unexpected quadstore size")
 
 	for _, test := range index {
 		v := qs.ValueOf(quad.Raw(test.query))
@@ -119,13 +136,14 @@ func TestIteratorsAndNextResultOrderA(t *testing.T) {
 
 	all := qs.NodesAllIterator()
 
-	innerAnd := iterator.NewAnd(qs,
-		iterator.NewLinksTo(qs, fixed2, quad.Predicate),
-		iterator.NewLinksTo(qs, all, quad.Object),
+	const allTag = "all"
+	innerAnd := iterator.NewAnd(
+		graph.NewLinksTo(qs, fixed2, quad.Predicate),
+		graph.NewLinksTo(qs, iterator.Tag(all, allTag), quad.Object),
 	)
 
-	hasa := iterator.NewHasA(qs, innerAnd, quad.Subject)
-	outerAnd := iterator.NewAnd(qs, fixed, hasa)
+	hasa := graph.NewHasA(qs, innerAnd, quad.Subject)
+	outerAnd := iterator.NewAnd(fixed, hasa).Iterate()
 
 	if !outerAnd.Next(ctx) {
 		t.Error("Expected one matching subtree")
@@ -140,7 +158,9 @@ func TestIteratorsAndNextResultOrderA(t *testing.T) {
 		expect = []string{"B", "D"}
 	)
 	for {
-		got = append(got, quad.ToString(qs.NameOf(all.Result())))
+		m := make(map[string]graph.Ref, 1)
+		outerAnd.TagResults(m)
+		got = append(got, quad.ToString(qs.NameOf(m[allTag])))
 		if !outerAnd.NextPath(ctx) {
 			break
 		}
@@ -159,31 +179,16 @@ func TestIteratorsAndNextResultOrderA(t *testing.T) {
 func TestLinksToOptimization(t *testing.T) {
 	qs, _, _ := makeTestStore(simpleGraph)
 
-	fixed := iterator.NewFixed()
-	fixed.Add(qs.ValueOf(quad.Raw("cool")))
+	lto := shape.BuildIterator(context.TODO(), qs, shape.Quads{
+		{Dir: quad.Object, Values: shape.Lookup{quad.Raw("cool")}},
+	})
 
-	lto := iterator.NewLinksTo(qs, fixed, quad.Object)
-	lto.Tagger().Add("foo")
-
-	newIt, changed := lto.Optimize()
-	if !changed {
-		t.Error("Iterator didn't change")
+	newIt, changed := lto.Optimize(context.TODO())
+	if changed {
+		t.Errorf("unexpected optimization step")
 	}
 	if _, ok := newIt.(*Iterator); !ok {
 		t.Fatal("Didn't swap out to LLRB")
-	}
-
-	v := newIt.(*Iterator)
-	vClone := v.Clone()
-	origDesc := graph.DescribeIterator(v)
-	cloneDesc := graph.DescribeIterator(vClone)
-	origDesc.UID, cloneDesc.UID = 0, 0 // We are more strict now, so fake UID equality.
-	if !reflect.DeepEqual(cloneDesc, origDesc) {
-		t.Fatalf("Unexpected iterator description.\ngot: %#v\nexpect: %#v", cloneDesc, origDesc)
-	}
-	vt := vClone.Tagger()
-	if len(vt.Tags()) < 1 || vt.Tags()[0] != "foo" {
-		t.Fatal("Tag on LinksTo did not persist")
 	}
 }
 
@@ -208,22 +213,23 @@ func TestRemoveQuad(t *testing.T) {
 	fixed2 := iterator.NewFixed()
 	fixed2.Add(qs.ValueOf(quad.Raw("follows")))
 
-	innerAnd := iterator.NewAnd(qs,
-		iterator.NewLinksTo(qs, fixed, quad.Subject),
-		iterator.NewLinksTo(qs, fixed2, quad.Predicate),
+	innerAnd := iterator.NewAnd(
+		graph.NewLinksTo(qs, fixed, quad.Subject),
+		graph.NewLinksTo(qs, fixed2, quad.Predicate),
 	)
 
-	hasa := iterator.NewHasA(qs, innerAnd, quad.Object)
+	hasa := graph.NewHasA(qs, innerAnd, quad.Object)
 
-	newIt, _ := hasa.Optimize()
-	if newIt.Next(ctx) {
+	newIt, _ := hasa.Optimize(ctx)
+	if newIt.Iterate().Next(ctx) {
 		t.Error("E should not have any followers.")
 	}
 }
 
 func TestTransaction(t *testing.T) {
 	qs, w, _ := makeTestStore(simpleGraph)
-	size := qs.Size()
+	st, err := qs.Stats(context.Background(), true)
+	require.NoError(t, err)
 
 	tx := graph.NewTransaction()
 	tx.AddQuad(quad.Make(
@@ -237,11 +243,11 @@ func TestTransaction(t *testing.T) {
 		"quad",
 		nil))
 
-	err := w.ApplyTransaction(tx)
+	err = w.ApplyTransaction(tx)
 	if err == nil {
 		t.Error("Able to remove a non-existent quad")
 	}
-	if size != qs.Size() {
-		t.Error("Appended a new quad in a failed transaction")
-	}
+	st2, err := qs.Stats(context.Background(), true)
+	require.NoError(t, err)
+	require.Equal(t, st, st2, "Appended a new quad in a failed transaction")
 }

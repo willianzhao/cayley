@@ -22,22 +22,18 @@ import (
 
 	"github.com/cayleygraph/cayley/graph"
 	"github.com/cayleygraph/cayley/graph/iterator"
-	"github.com/cayleygraph/cayley/graph/shape"
-	"github.com/cayleygraph/cayley/quad"
+	"github.com/cayleygraph/cayley/graph/refs"
+	"github.com/cayleygraph/cayley/query/shape"
+	"github.com/cayleygraph/quad"
 )
-
-func (qs *QuadStore) OptimizeIterator(it graph.Iterator) (graph.Iterator, bool) {
-	// everything is done in shapes optimizer
-	return it, false
-}
 
 var _ shape.Optimizer = (*QuadStore)(nil)
 
-func (qs *QuadStore) OptimizeShape(s shape.Shape) (shape.Shape, bool) {
-	return qs.opt.OptimizeShape(s)
+func (qs *QuadStore) OptimizeShape(ctx context.Context, s shape.Shape) (shape.Shape, bool) {
+	return qs.opt.OptimizeShape(ctx, s)
 }
 
-func (qs *QuadStore) Query(ctx context.Context, s Shape) (*sql.Rows, error) {
+func (qs *QuadStore) prepareQuery(s Shape) (string, []interface{}) {
 	args := s.Args()
 	vals := make([]interface{}, 0, len(args))
 	for _, a := range args {
@@ -45,6 +41,16 @@ func (qs *QuadStore) Query(ctx context.Context, s Shape) (*sql.Rows, error) {
 	}
 	b := NewBuilder(qs.flavor.QueryDialect)
 	qu := s.SQL(b)
+	return qu, vals
+}
+
+func (qs *QuadStore) QueryRow(ctx context.Context, s Shape) *sql.Row {
+	qu, vals := qs.prepareQuery(s)
+	return qs.db.QueryRowContext(ctx, qu, vals...)
+}
+
+func (qs *QuadStore) Query(ctx context.Context, s Shape) (*sql.Rows, error) {
+	qu, vals := qs.prepareQuery(s)
 	rows, err := qs.db.QueryContext(ctx, qu, vals...)
 	if err != nil {
 		return nil, fmt.Errorf("sql query failed: %v\nquery: %v", err, qu)
@@ -52,51 +58,98 @@ func (qs *QuadStore) Query(ctx context.Context, s Shape) (*sql.Rows, error) {
 	return rows, nil
 }
 
-var _ graph.Iterator = (*Iterator)(nil)
-
-func (qs *QuadStore) NewIterator(s Select) *Iterator {
+func (qs *QuadStore) newIterator(s Select) *Iterator {
 	return &Iterator{
 		qs:    qs,
-		uid:   iterator.NextUID(),
 		query: s,
 	}
 }
 
 type Iterator struct {
-	qs     *QuadStore
-	uid    uint64
-	tagger graph.Tagger
-	query  Select
+	qs    *QuadStore
+	query Select
+	err   error
+}
+
+func (it *Iterator) Iterate() iterator.Scanner {
+	return it.qs.newIteratorNext(it.query)
+}
+
+func (it *Iterator) Lookup() iterator.Index {
+	return it.qs.newIteratorContains(it.query)
+}
+
+func (it *Iterator) Stats(ctx context.Context) (iterator.Costs, error) {
+	sz, err := it.getSize(ctx)
+	return iterator.Costs{
+		NextCost:     1,
+		ContainsCost: 10,
+		Size:         sz,
+	}, err
+}
+
+func (it *Iterator) estimateSize(ctx context.Context) int64 {
+	if it.query.Limit > 0 {
+		return it.query.Limit
+	}
+	st, err := it.qs.Stats(ctx, false)
+	if err != nil && it.err == nil {
+		it.err = err
+	}
+	return st.Quads.Value
+}
+
+func (it *Iterator) getSize(ctx context.Context) (refs.Size, error) {
+	sz, err := it.qs.querySize(ctx, it.query)
+	if err != nil {
+		it.err = err
+		return refs.Size{Value: it.estimateSize(ctx), Exact: false}, err
+	}
+	return sz, nil
+}
+
+func (it *Iterator) Optimize(ctx context.Context) (iterator.Shape, bool) {
+	return it, false
+}
+
+func (it *Iterator) SubIterators() []iterator.Shape {
+	return nil
+}
+
+func (it *Iterator) String() string {
+	return it.query.SQL(NewBuilder(it.qs.flavor.QueryDialect))
+}
+
+func newIteratorBase(qs *QuadStore, s Select) iteratorBase {
+	return iteratorBase{
+		qs:    qs,
+		query: s,
+	}
+}
+
+type iteratorBase struct {
+	qs    *QuadStore
+	query Select
 
 	cols []string
 	cind map[quad.Direction]int
 
-	err    error
-	res    graph.Value
-	tags   map[string]graph.Value
-	cursor *sql.Rows
+	err  error
+	res  graph.Ref
+	tags map[string]graph.Ref
 }
 
-func (it *Iterator) UID() uint64 {
-	return it.uid
-}
-
-func (it *Iterator) Tagger() *graph.Tagger {
-	return &it.tagger
-}
-
-func (it *Iterator) TagResults(m map[string]graph.Value) {
+func (it *iteratorBase) TagResults(m map[string]graph.Ref) {
 	for tag, val := range it.tags {
 		m[tag] = val
 	}
-	it.tagger.TagResult(m, it.Result())
 }
 
-func (it *Iterator) Result() graph.Value {
+func (it *iteratorBase) Result() graph.Ref {
 	return it.res
 }
 
-func (it *Iterator) ensureColumns() {
+func (it *iteratorBase) ensureColumns() {
 	if it.cols != nil {
 		return
 	}
@@ -120,7 +173,7 @@ func (it *Iterator) ensureColumns() {
 	}
 }
 
-func (it *Iterator) scanValue(r *sql.Rows) bool {
+func (it *iteratorBase) scanValue(r *sql.Rows) bool {
 	it.ensureColumns()
 	nodes := make([]NodeHash, len(it.cols))
 	pointers := make([]interface{}, len(nodes))
@@ -131,7 +184,7 @@ func (it *Iterator) scanValue(r *sql.Rows) bool {
 		it.err = err
 		return false
 	}
-	it.tags = make(map[string]graph.Value)
+	it.tags = make(map[string]graph.Ref)
 	for i, name := range it.cols {
 		if !strings.Contains(name, tagPref) {
 			it.tags[name] = nodes[i].ValueHash
@@ -159,14 +212,73 @@ func (it *Iterator) scanValue(r *sql.Rows) bool {
 	return true
 }
 
-func (it *Iterator) Next(ctx context.Context) bool {
+func (it *iteratorBase) Err() error {
+	return it.err
+}
+
+func (it *iteratorBase) String() string {
+	return it.query.SQL(NewBuilder(it.qs.flavor.QueryDialect))
+}
+
+func (qs *QuadStore) newIteratorNext(s Select) *iteratorNext {
+	return &iteratorNext{
+		iteratorBase: newIteratorBase(qs, s),
+	}
+}
+
+type iteratorNext struct {
+	iteratorBase
+	cursor *sql.Rows
+	// TODO(dennwc): nextPath workaround; remove when we get rid of NextPath in general
+	nextPathRes  graph.Ref
+	nextPathTags map[string]graph.Ref
+}
+
+func (it *iteratorNext) Next(ctx context.Context) bool {
 	if it.err != nil {
 		return false
 	}
 	if it.cursor == nil {
 		it.cursor, it.err = it.qs.Query(ctx, it.query)
 	}
+	// TODO(dennwc): this loop exists only because of nextPath workaround
+	for {
+		if it.err != nil {
+			return false
+		}
+		if it.nextPathRes != nil {
+			it.res = it.nextPathRes
+			it.tags = it.nextPathTags
+			it.nextPathRes = nil
+			it.nextPathTags = nil
+			return true
+		}
+		if !it.cursor.Next() {
+			it.err = it.cursor.Err()
+			it.cursor.Close()
+			return false
+		}
+
+		prev := it.res
+		if !it.scanValue(it.cursor) {
+			return false
+		}
+		if !it.query.nextPath {
+			return true
+		}
+		if prev == nil || prev.Key() != it.res.Key() {
+			return true
+		}
+		// skip the same main key if in nextPath mode
+		// the user should receive accept those results via NextPath of the iterator
+	}
+}
+
+func (it *iteratorNext) NextPath(ctx context.Context) bool {
 	if it.err != nil {
+		return false
+	}
+	if !it.query.nextPath {
 		return false
 	}
 	if !it.cursor.Next() {
@@ -174,14 +286,42 @@ func (it *Iterator) Next(ctx context.Context) bool {
 		it.cursor.Close()
 		return false
 	}
-	return it.scanValue(it.cursor)
-}
-
-func (it *Iterator) NextPath(ctx context.Context) bool {
+	prev := it.res
+	if !it.scanValue(it.cursor) {
+		return false
+	}
+	if prev.Key() == it.res.Key() {
+		return true
+	}
+	// different main keys - return false, but keep this results for the Next
+	it.nextPathRes = it.res
+	it.nextPathTags = it.tags
+	it.res = nil
+	it.tags = nil
 	return false
 }
 
-func (it *Iterator) Contains(ctx context.Context, v graph.Value) bool {
+func (it *iteratorNext) Close() error {
+	if it.cursor != nil {
+		it.cursor.Close()
+		it.cursor = nil
+	}
+	return nil
+}
+
+func (qs *QuadStore) newIteratorContains(s Select) *iteratorContains {
+	return &iteratorContains{
+		iteratorBase: newIteratorBase(qs, s),
+	}
+}
+
+type iteratorContains struct {
+	iteratorBase
+	// TODO(dennwc): nextPath workaround; remove when we get rid of NextPath in general
+	nextPathRows *sql.Rows
+}
+
+func (it *iteratorContains) Contains(ctx context.Context, v graph.Ref) bool {
 	it.ensureColumns()
 	sel := it.query
 	sel.Where = append([]Where{}, sel.Where...)
@@ -215,7 +355,14 @@ func (it *Iterator) Contains(ctx context.Context, v graph.Value) bool {
 		it.err = err
 		return false
 	}
-	defer rows.Close()
+	if it.query.nextPath {
+		if it.nextPathRows != nil {
+			_ = it.nextPathRows.Close()
+		}
+		it.nextPathRows = rows
+	} else {
+		defer rows.Close()
+	}
 	if !rows.Next() {
 		it.err = rows.Err()
 		return false
@@ -223,89 +370,23 @@ func (it *Iterator) Contains(ctx context.Context, v graph.Value) bool {
 	return it.scanValue(rows)
 }
 
-func (it *Iterator) Err() error {
-	return it.err
-}
-
-func (it *Iterator) Reset() {
-	it.cols = nil
-	it.cind = nil
-	it.res = nil
-	it.err = nil
-	if it.cursor != nil {
-		it.cursor.Close()
-		it.cursor = nil
+func (it *iteratorContains) NextPath(ctx context.Context) bool {
+	if it.err != nil {
+		return false
 	}
-}
-
-func (it *Iterator) Clone() graph.Iterator {
-	it2 := it.qs.NewIterator(it.query)
-	it2.tagger.CopyFrom(it)
-	return it2
-}
-
-func (it *Iterator) Stats() graph.IteratorStats {
-	sz, exact := it.Size()
-	return graph.IteratorStats{
-		NextCost:     1,
-		ContainsCost: 10,
-		Size:         sz, ExactSize: exact,
+	if !it.query.nextPath {
+		return false
 	}
-}
-
-func (it *Iterator) estimateSize() int64 {
-	if it.query.Limit > 0 {
-		return it.query.Limit
+	if !it.nextPathRows.Next() {
+		it.err = it.nextPathRows.Err()
+		return false
 	}
-	return it.qs.Size()
+	return it.scanValue(it.nextPathRows)
 }
 
-func (it *Iterator) Size() (int64, bool) {
-	sel := it.query
-	sel.Fields = []Field{
-		{Name: "COUNT(*)", Raw: true}, // TODO: proper support for expressions
-	}
-	rows, err := it.qs.Query(context.TODO(), sel)
-	if err != nil {
-		it.err = err
-		return it.estimateSize(), false
-	}
-	defer rows.Close()
-	if !rows.Next() {
-		it.err = rows.Err()
-		return it.estimateSize(), false
-	}
-	var n int64
-	if err := rows.Scan(&n); err != nil {
-		it.err = err
-		return it.estimateSize(), false
-	}
-	return n, true
-}
-
-func (it *Iterator) Type() graph.Type {
-	if it.query.isAll() {
-		return graph.All
-	}
-	return "sql-shape"
-}
-
-func (it *Iterator) Optimize() (graph.Iterator, bool) {
-	return it, false
-}
-
-func (it *Iterator) SubIterators() []graph.Iterator {
-	return nil
-}
-
-func (it *Iterator) String() string {
-	return it.query.SQL(NewBuilder(it.qs.flavor.QueryDialect))
-}
-
-func (it *Iterator) Close() error {
-	if it.cursor != nil {
-		it.cursor.Close()
-		it.cursor = nil
+func (it *iteratorContains) Close() error {
+	if it.nextPathRows != nil {
+		return it.nextPathRows.Close()
 	}
 	return nil
 }

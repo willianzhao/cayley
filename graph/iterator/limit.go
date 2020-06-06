@@ -4,87 +4,103 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cayleygraph/cayley/graph"
+	"github.com/cayleygraph/cayley/graph/refs"
 )
 
-var _ graph.Iterator = &Limit{}
-
 // Limit iterator will stop iterating if certain a number of values were encountered.
-// Zero and negative limit values means no limit.
+// Zero and negative Limit values means no Limit.
 type Limit struct {
-	uid       uint64
-	limit     int64
-	count     int64
-	primaryIt graph.Iterator
+	limit int64
+	it    Shape
 }
 
-func NewLimit(primaryIt graph.Iterator, limit int64) *Limit {
+func NewLimit(it Shape, max int64) *Limit {
 	return &Limit{
-		uid:       NextUID(),
-		limit:     limit,
-		primaryIt: primaryIt,
+		limit: max,
+		it:    it,
 	}
 }
 
-func (it *Limit) UID() uint64 {
-	return it.uid
+func (it *Limit) Iterate() Scanner {
+	return NewLimitNext(it.it.Iterate(), it.limit)
 }
 
-// Reset resets the internal iterators and the iterator itself.
-func (it *Limit) Reset() {
-	it.count = 0
-	it.primaryIt.Reset()
-}
-
-func (it *Limit) Tagger() *graph.Tagger {
-	return it.primaryIt.Tagger()
-}
-
-func (it *Limit) TagResults(dst map[string]graph.Value) {
-	it.primaryIt.TagResults(dst)
-}
-
-func (it *Limit) Clone() graph.Iterator {
-	return NewLimit(it.primaryIt.Clone(), it.limit)
+func (it *Limit) Lookup() Index {
+	return newLimitContains(it.it.Lookup(), it.limit)
 }
 
 // SubIterators returns a slice of the sub iterators.
-func (it *Limit) SubIterators() []graph.Iterator {
-	return []graph.Iterator{it.primaryIt}
+func (it *Limit) SubIterators() []Shape {
+	return []Shape{it.it}
 }
 
-// Next advances the Limit iterator. It will stop iteration if limit was reached.
-func (it *Limit) Next(ctx context.Context) bool {
-	graph.NextLogIn(it)
-	if it.limit > 0 && it.count >= it.limit {
-		return graph.NextLogOut(it, false)
+func (it *Limit) Optimize(ctx context.Context) (Shape, bool) {
+	nit, optimized := it.it.Optimize(ctx)
+	if it.limit <= 0 { // no Limit
+		return nit, true
 	}
-	if it.primaryIt.Next(ctx) {
-		it.count++
-		return graph.NextLogOut(it, true)
+	it.it = nit
+	return it, optimized
+}
+
+func (it *Limit) Stats(ctx context.Context) (Costs, error) {
+	st, err := it.it.Stats(ctx)
+	if it.limit > 0 && st.Size.Value > it.limit {
+		st.Size.Value = it.limit
 	}
-	return graph.NextLogOut(it, false)
+	return st, err
 }
 
-func (it *Limit) Err() error {
-	return it.primaryIt.Err()
+func (it *Limit) String() string {
+	return fmt.Sprintf("Limit(%d)", it.limit)
 }
 
-func (it *Limit) Result() graph.Value {
-	return it.primaryIt.Result()
+// Limit iterator will stop iterating if certain a number of values were encountered.
+// Zero and negative Limit values means no Limit.
+type limitNext struct {
+	limit int64
+	count int64
+	it    Scanner
 }
 
-func (it *Limit) Contains(ctx context.Context, val graph.Value) bool {
-	return it.primaryIt.Contains(ctx, val) // FIXME(dennwc): limit is ignored in this case
+func NewLimitNext(it Scanner, limit int64) Scanner {
+	return &limitNext{
+		limit: limit,
+		it:    it,
+	}
 }
 
-// NextPath checks whether there is another path. Will call primary iterator
-// if limit is not reached yet.
-func (it *Limit) NextPath(ctx context.Context) bool {
+func (it *limitNext) TagResults(dst map[string]refs.Ref) {
+	it.it.TagResults(dst)
+}
+
+// Next advances the Limit iterator. It will stop iteration if Limit was reached.
+func (it *limitNext) Next(ctx context.Context) bool {
 	if it.limit > 0 && it.count >= it.limit {
 		return false
 	}
-	if it.primaryIt.NextPath(ctx) {
+	if it.it.Next(ctx) {
+		it.count++
+		return true
+	}
+	return false
+}
+
+func (it *limitNext) Err() error {
+	return it.it.Err()
+}
+
+func (it *limitNext) Result() refs.Ref {
+	return it.it.Result()
+}
+
+// NextPath checks whether there is another path. Will call primary iterator
+// if Limit is not reached yet.
+func (it *limitNext) NextPath(ctx context.Context) bool {
+	if it.limit > 0 && it.count >= it.limit {
+		return false
+	}
+	if it.it.NextPath(ctx) {
 		it.count++
 		return true
 	}
@@ -93,37 +109,71 @@ func (it *Limit) NextPath(ctx context.Context) bool {
 
 // Close closes the primary and all iterators.  It closes all subiterators
 // it can, but returns the first error it encounters.
-func (it *Limit) Close() error {
-	return it.primaryIt.Close()
+func (it *limitNext) Close() error {
+	return it.it.Close()
 }
 
-func (it *Limit) Type() graph.Type { return graph.Limit }
+func (it *limitNext) String() string {
+	return fmt.Sprintf("LimitNext(%d)", it.limit)
+}
 
-func (it *Limit) Optimize() (graph.Iterator, bool) {
-	optimizedPrimaryIt, optimized := it.primaryIt.Optimize()
-	if it.limit <= 0 { // no limit
-		return optimizedPrimaryIt, true
+// Limit iterator will stop iterating if certain a number of values were encountered.
+// Zero and negative Limit values means no Limit.
+type limitContains struct {
+	limit int64
+	count int64
+	it    Index
+}
+
+func newLimitContains(it Index, limit int64) *limitContains {
+	return &limitContains{
+		limit: limit,
+		it:    it,
 	}
-	it.primaryIt = optimizedPrimaryIt
-	return it, optimized
 }
 
-func (it *Limit) Stats() graph.IteratorStats {
-	primaryStats := it.primaryIt.Stats()
-	if it.limit > 0 && primaryStats.Size > it.limit {
-		primaryStats.Size = it.limit
+func (it *limitContains) TagResults(dst map[string]refs.Ref) {
+	it.it.TagResults(dst)
+}
+
+func (it *limitContains) Err() error {
+	return it.it.Err()
+}
+
+func (it *limitContains) Result() refs.Ref {
+	return it.it.Result()
+}
+
+func (it *limitContains) Contains(ctx context.Context, val refs.Ref) bool {
+	if it.limit > 0 && it.count >= it.limit {
+		return false
 	}
-	return primaryStats
-}
-
-func (it *Limit) Size() (int64, bool) {
-	primarySize, exact := it.primaryIt.Size()
-	if it.limit > 0 && primarySize > it.limit {
-		primarySize = it.limit
+	if it.it.Contains(ctx, val) {
+		it.count++
+		return true
 	}
-	return primarySize, exact
+	return false
 }
 
-func (it *Limit) String() string {
-	return fmt.Sprintf("Limit(%d)", it.limit)
+// NextPath checks whether there is another path. Will call primary iterator
+// if Limit is not reached yet.
+func (it *limitContains) NextPath(ctx context.Context) bool {
+	if it.limit > 0 && it.count >= it.limit {
+		return false
+	}
+	if it.it.NextPath(ctx) {
+		it.count++
+		return true
+	}
+	return false
+}
+
+// Close closes the primary and all iterators.  It closes all subiterators
+// it can, but returns the first error it encounters.
+func (it *limitContains) Close() error {
+	return it.it.Close()
+}
+
+func (it *limitContains) String() string {
+	return fmt.Sprintf("LimitContains(%d)", it.limit)
 }

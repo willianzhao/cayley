@@ -17,76 +17,47 @@ package iterator
 // Defines one of the base iterators, the Fixed iterator. A fixed iterator is quite simple; it
 // contains an explicit fixed array of values.
 //
-// A fixed iterator requires an Equality function to be passed to it, by reason that graph.Value, the
+// A fixed iterator requires an Equality function to be passed to it, by reason that refs.Ref, the
 // opaque Quad store value, may not answer to ==.
 
 import (
 	"context"
 	"fmt"
 
-	"github.com/cayleygraph/cayley/graph"
+	"github.com/cayleygraph/cayley/graph/refs"
 )
 
-var _ graph.Iterator = &Fixed{}
+var _ Shape = &Fixed{}
 
 // A Fixed iterator consists of it's values, an index (where it is in the process of Next()ing) and
 // an equality function.
 type Fixed struct {
-	uid       uint64
-	tags      graph.Tagger
-	values    []graph.Value
-	lastIndex int
-	result    graph.Value
+	values []refs.Ref
 }
 
-// Creates a new Fixed iterator with a custom comparator.
-func NewFixed(vals ...graph.Value) *Fixed {
-	it := &Fixed{
-		uid:    NextUID(),
-		values: make([]graph.Value, 0, 20),
+// NewFixed creates a new Fixed iterator with a custom comparator.
+func NewFixed(vals ...refs.Ref) *Fixed {
+	return &Fixed{
+		values: append([]refs.Ref{}, vals...),
 	}
-	for _, v := range vals {
-		it.Add(v)
-	}
-	return it
 }
 
-func (it *Fixed) UID() uint64 {
-	return it.uid
+func (it *Fixed) Iterate() Scanner {
+	return newFixedNext(it.values)
 }
 
-func (it *Fixed) Reset() {
-	it.lastIndex = 0
-}
-
-func (it *Fixed) Close() error {
-	return nil
-}
-
-func (it *Fixed) Tagger() *graph.Tagger {
-	return &it.tags
-}
-
-func (it *Fixed) TagResults(dst map[string]graph.Value) {
-	it.tags.TagResult(dst, it.Result())
-}
-
-func (it *Fixed) Clone() graph.Iterator {
-	vals := make([]graph.Value, len(it.values))
-	copy(vals, it.values)
-	out := NewFixed(vals...)
-	out.tags.CopyFrom(it)
-	return out
+func (it *Fixed) Lookup() Index {
+	return newFixedContains(it.values)
 }
 
 // Add a value to the iterator. The array now contains this value.
 // TODO(barakmich): This ought to be a set someday, disallowing repeated values.
-func (it *Fixed) Add(v graph.Value) {
+func (it *Fixed) Add(v refs.Ref) {
 	it.values = append(it.values, v)
 }
 
-// Values returns a list of values stored in iterator. Slice should not be modified.
-func (it *Fixed) Values() []graph.Value {
+// Values returns a list of values stored in iterator. Slice must not be modified.
+func (it *Fixed) Values() []refs.Ref {
 	return it.values
 }
 
@@ -94,58 +65,15 @@ func (it *Fixed) String() string {
 	return fmt.Sprintf("Fixed(%v)", it.values)
 }
 
-// Register this iterator as a Fixed iterator.
-func (it *Fixed) Type() graph.Type { return graph.Fixed }
-
-// Check if the passed value is equal to one of the values stored in the iterator.
-func (it *Fixed) Contains(ctx context.Context, v graph.Value) bool {
-	// Could be optimized by keeping it sorted or using a better datastructure.
-	// However, for fixed iterators, which are by definition kind of tiny, this
-	// isn't a big issue.
-	graph.ContainsLogIn(it, v)
-	vk := graph.ToKey(v)
-	for _, x := range it.values {
-		if graph.ToKey(x) == vk {
-			it.result = x
-			return graph.ContainsLogOut(it, v, true)
-		}
-	}
-	return graph.ContainsLogOut(it, v, false)
-}
-
-// Next advances the iterator.
-func (it *Fixed) Next(ctx context.Context) bool {
-	graph.NextLogIn(it)
-	if it.lastIndex == len(it.values) {
-		return graph.NextLogOut(it, false)
-	}
-	out := it.values[it.lastIndex]
-	it.result = out
-	it.lastIndex++
-	return graph.NextLogOut(it, true)
-}
-
-func (it *Fixed) Err() error {
-	return nil
-}
-
-func (it *Fixed) Result() graph.Value {
-	return it.result
-}
-
-func (it *Fixed) NextPath(ctx context.Context) bool {
-	return false
-}
-
 // No sub-iterators.
-func (it *Fixed) SubIterators() []graph.Iterator {
+func (it *Fixed) SubIterators() []Shape {
 	return nil
 }
 
 // Optimize() for a Fixed iterator is simple. Returns a Null iterator if it's empty
 // (so that other iterators upstream can treat this as null) or there is no
 // optimization.
-func (it *Fixed) Optimize() (graph.Iterator, bool) {
+func (it *Fixed) Optimize(ctx context.Context) (Shape, bool) {
 	if len(it.values) == 1 && it.values[0] == nil {
 		return NewNull(), true
 	}
@@ -153,19 +81,120 @@ func (it *Fixed) Optimize() (graph.Iterator, bool) {
 	return it, false
 }
 
-// Size is the number of values stored.
-func (it *Fixed) Size() (int64, bool) {
-	return int64(len(it.values)), true
-}
-
 // As we right now have to scan the entire list, Next and Contains are linear with the
 // size. However, a better data structure could remove these limits.
-func (it *Fixed) Stats() graph.IteratorStats {
-	s, exact := it.Size()
-	return graph.IteratorStats{
-		ContainsCost: s,
-		NextCost:     s,
-		Size:         s,
-		ExactSize:    exact,
+func (it *Fixed) Stats(ctx context.Context) (Costs, error) {
+	return Costs{
+		ContainsCost: 1,
+		NextCost:     1,
+		Size: refs.Size{
+			Value: int64(len(it.values)),
+			Exact: true,
+		},
+	}, nil
+}
+
+// A Fixed iterator consists of it's values, an index (where it is in the process of Next()ing) and
+// an equality function.
+type fixedNext struct {
+	values []refs.Ref
+	ind    int
+	result refs.Ref
+}
+
+// Creates a new Fixed iterator with a custom comparator.
+func newFixedNext(vals []refs.Ref) *fixedNext {
+	return &fixedNext{
+		values: vals,
 	}
+}
+
+func (it *fixedNext) Close() error {
+	return nil
+}
+
+func (it *fixedNext) TagResults(dst map[string]refs.Ref) {}
+
+func (it *fixedNext) String() string {
+	return fmt.Sprintf("Fixed(%v)", it.values)
+}
+
+// Next advances the iterator.
+func (it *fixedNext) Next(ctx context.Context) bool {
+	if it.ind >= len(it.values) {
+		return false
+	}
+	out := it.values[it.ind]
+	it.result = out
+	it.ind++
+	return true
+}
+
+func (it *fixedNext) Err() error {
+	return nil
+}
+
+func (it *fixedNext) Result() refs.Ref {
+	return it.result
+}
+
+func (it *fixedNext) NextPath(ctx context.Context) bool {
+	return false
+}
+
+// A Fixed iterator consists of it's values, an index (where it is in the process of Next()ing) and
+// an equality function.
+type fixedContains struct {
+	values []refs.Ref
+	keys   []interface{}
+	result refs.Ref
+}
+
+// Creates a new Fixed iterator with a custom comparator.
+func newFixedContains(vals []refs.Ref) *fixedContains {
+	keys := make([]interface{}, 0, len(vals))
+	for _, v := range vals {
+		keys = append(keys, refs.ToKey(v))
+	}
+	return &fixedContains{
+		values: vals,
+		keys:   keys,
+	}
+}
+
+func (it *fixedContains) Close() error {
+	return nil
+}
+
+func (it *fixedContains) TagResults(dst map[string]refs.Ref) {}
+
+func (it *fixedContains) String() string {
+	return fmt.Sprintf("Fixed(%v)", it.values)
+}
+
+// Check if the passed value is equal to one of the values stored in the iterator.
+func (it *fixedContains) Contains(ctx context.Context, v refs.Ref) bool {
+	// Could be optimized by keeping it sorted or using a better datastructure.
+	// However, for fixed iterators, which are by definition kind of tiny, this
+	// isn't a big issue.
+	vk := refs.ToKey(v)
+	for i, x := range it.keys {
+		if x == vk {
+			it.result = it.values[i]
+			return true
+		}
+	}
+	return false
+}
+
+func (it *fixedContains) Err() error {
+	return nil
+}
+
+func (it *fixedContains) Result() refs.Ref {
+	return it.result
+}
+
+func (it *fixedContains) NextPath(ctx context.Context) bool {
+	return false
 }

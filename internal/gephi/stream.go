@@ -16,11 +16,12 @@ import (
 	"github.com/cayleygraph/cayley/clog"
 	"github.com/cayleygraph/cayley/graph"
 	"github.com/cayleygraph/cayley/graph/iterator"
-	"github.com/cayleygraph/cayley/graph/path"
-	"github.com/cayleygraph/cayley/quad"
-	"github.com/cayleygraph/cayley/voc/rdf"
-	"github.com/cayleygraph/cayley/voc/rdfs"
-	"github.com/cayleygraph/cayley/voc/schema"
+	"github.com/cayleygraph/cayley/query/path"
+	"github.com/cayleygraph/cayley/query/shape"
+	"github.com/cayleygraph/quad"
+	"github.com/cayleygraph/quad/voc/rdf"
+	"github.com/cayleygraph/quad/voc/rdfs"
+	"github.com/cayleygraph/quad/voc/schema"
 )
 
 const (
@@ -212,28 +213,8 @@ type graphStreamEvent struct {
 	DelEdges    map[string]streamEdge `json:"de,omitempty"`
 }
 
-func (s *GraphStreamHandler) serveRawQuads(ctx context.Context, gs *GraphStream, sub, pred, obj, label []quad.Value, limit int) {
-	var it graph.Iterator
-	if len(sub)+len(pred)+len(obj)+len(label) == 0 {
-		it = s.QS.QuadsAllIterator()
-	} else {
-		var subIt []graph.Iterator
-		linksTo := func(d quad.Direction, vals []quad.Value) {
-			if len(vals) == 0 {
-				return
-			}
-			fixed := iterator.NewFixed()
-			for _, v := range vals {
-				fixed.Add(s.QS.ValueOf(v))
-			}
-			subIt = append(subIt, iterator.NewLinksTo(s.QS, fixed, d))
-		}
-		linksTo(quad.Subject, sub)
-		linksTo(quad.Predicate, pred)
-		linksTo(quad.Object, obj)
-		linksTo(quad.Label, label)
-		it = iterator.NewAnd(s.QS, subIt...)
-	}
+func (s *GraphStreamHandler) serveRawQuads(ctx context.Context, gs *GraphStream, quads shape.Shape, limit int) {
+	it := shape.BuildIterator(ctx, s.QS, quads).Iterate()
 	defer it.Close()
 
 	var sh, oh valHash
@@ -284,16 +265,15 @@ func (s *GraphStreamHandler) serveNodesWithProps(ctx context.Context, gs *GraphS
 
 	ignore := make(map[quad.Value]struct{})
 
-	nodes := iterator.NewNot(propsPath.BuildIterator(), s.QS.NodesAllIterator())
-	defer nodes.Close()
+	nodes := iterator.NewNot(propsPath.BuildIterator(ctx), s.QS.NodesAllIterator())
 
 	ictx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	itc := graph.Iterate(ictx, nodes).On(s.QS).Limit(limit)
+	itc := iterator.Iterate(ictx, nodes).On(s.QS).Limit(limit)
 
 	qi := 0
-	_ = itc.EachValuePair(s.QS, func(v graph.Value, nv quad.Value) {
+	_ = itc.EachValuePair(s.QS, func(v graph.Ref, nv quad.Value) {
 		if _, skip := ignore[nv]; skip {
 			return
 		}
@@ -306,7 +286,7 @@ func (s *GraphStreamHandler) serveNodesWithProps(ctx context.Context, gs *GraphS
 		)
 		quad.HashTo(nv, h[:])
 
-		predIt := s.QS.QuadIterator(quad.Subject, nodes.Result())
+		predIt := s.QS.QuadIterator(quad.Subject, v).Iterate()
 		defer predIt.Close()
 		for predIt.Next(ictx) {
 			// this check helps us ignore nodes with no links
@@ -381,11 +361,13 @@ func (s *GraphStreamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, p
 	case "nodes":
 		s.serveNodesWithProps(ctx, gs, limit)
 	case "raw":
-		sub := valuesFromString(r.FormValue("sub"))
-		pred := valuesFromString(r.FormValue("pred"))
-		obj := valuesFromString(r.FormValue("obj"))
-		label := valuesFromString(r.FormValue("label"))
-		s.serveRawQuads(ctx, gs, sub, pred, obj, label, limit)
+		values := shape.FilterQuads(
+			valuesFromString(r.FormValue("sub")),
+			valuesFromString(r.FormValue("pred")),
+			valuesFromString(r.FormValue("obj")),
+			valuesFromString(r.FormValue("label")),
+		)
+		s.serveRawQuads(ctx, gs, values, limit)
 	default:
 		w.WriteHeader(http.StatusBadRequest)
 		return

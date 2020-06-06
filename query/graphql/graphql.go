@@ -15,9 +15,11 @@ import (
 	"github.com/dennwc/graphql/language/parser"
 
 	"github.com/cayleygraph/cayley/graph"
-	"github.com/cayleygraph/cayley/graph/path"
-	"github.com/cayleygraph/cayley/quad"
+	"github.com/cayleygraph/cayley/graph/iterator"
+	"github.com/cayleygraph/cayley/graph/refs"
 	"github.com/cayleygraph/cayley/query"
+	"github.com/cayleygraph/cayley/query/path"
+	"github.com/cayleygraph/quad"
 )
 
 const Name = "graphql"
@@ -41,9 +43,6 @@ func init() {
 		Session: func(qs graph.QuadStore) query.Session {
 			return NewSession(qs)
 		},
-		REPL: func(qs graph.QuadStore) query.REPLSession {
-			return NewSession(qs)
-		},
 		HTTPError: httpError,
 		HTTPQuery: httpQuery,
 	})
@@ -53,40 +52,62 @@ func NewSession(qs graph.QuadStore) *Session {
 	return &Session{qs: qs}
 }
 
-type resultMap map[string]interface{}
-
-func (resultMap) Err() error            { return nil }
-func (m resultMap) Result() interface{} { return map[string]interface{}(m) }
-
 type Session struct {
 	qs graph.QuadStore
 }
 
-func (s *Session) Execute(ctx context.Context, qu string, out chan query.Result, limit int) {
-	defer close(out)
+func (s *Session) Execute(ctx context.Context, qu string, opt query.Options) (query.Iterator, error) {
+	switch opt.Collation {
+	case query.Raw, query.JSON, query.REPL:
+	default:
+		return nil, &query.ErrUnsupportedCollation{Collation: opt.Collation}
+	}
 	q, err := Parse(strings.NewReader(qu))
 	if err != nil {
-		select {
-		case out <- query.ErrorResult(err):
-		case <-ctx.Done():
-		}
-		return
+		return nil, err
 	}
-	m, err := q.Execute(ctx, s.qs)
-	var r query.Result
-	if err != nil {
-		r = query.ErrorResult(err)
-	} else {
-		r = resultMap(m)
-	}
-	select {
-	case out <- r:
-	case <-ctx.Done():
-	}
+	return &results{
+		s:   s,
+		q:   q,
+		col: opt.Collation,
+	}, nil
 }
-func (s *Session) FormatREPL(result query.Result) string {
-	data, _ := json.MarshalIndent(result, "", "   ")
+
+type results struct {
+	s   *Session
+	q   *Query
+	col query.Collation
+	res map[string]interface{}
+	err error
+}
+
+func (it *results) Next(ctx context.Context) bool {
+	if it.q == nil {
+		return false
+	}
+	it.res, it.err = it.q.Execute(ctx, it.s.qs)
+	it.q = nil
+	return it.err == nil && len(it.res) != 0
+}
+
+func (it *results) Result() interface{} {
+	if len(it.res) == 0 {
+		return nil
+	}
+	if it.col != query.REPL {
+		return it.res
+	}
+	data, _ := json.MarshalIndent(it.res, "", "   ")
 	return string(data)
+}
+
+func (it *results) Err() error {
+	return it.err
+}
+
+func (it *results) Close() error {
+	it.q = nil
+	return nil
 }
 
 // Configurable keywords and special field names.
@@ -123,13 +144,12 @@ type field struct {
 func (f field) isSave() bool { return len(f.Has)+len(f.Fields) == 0 && !f.AllFields }
 
 type object struct {
-	id     graph.Value
+	id     graph.Ref
 	fields map[string]interface{}
 }
 
-func buildIterator(qs graph.QuadStore, p *path.Path) graph.Iterator {
-	it, _ := p.BuildIterator().Optimize()
-	it, _ = qs.OptimizeIterator(it)
+func buildIterator(ctx context.Context, qs graph.QuadStore, p *path.Path) iterator.Shape {
+	it, _ := p.BuildIterator(ctx).Optimize(ctx)
 	return it
 }
 
@@ -189,7 +209,7 @@ func iterateObject(ctx context.Context, qs graph.QuadStore, f *field, p *path.Pa
 	if f.AllFields {
 		tail()
 
-		it := buildIterator(qs, p)
+		it := buildIterator(ctx, qs, p).Iterate()
 		defer it.Close()
 
 		// we don't care about alternative paths to nodes here, so we will not call NextPath
@@ -207,7 +227,7 @@ func iterateObject(ctx context.Context, qs graph.QuadStore, f *field, p *path.Pa
 			obj := make(map[string]interface{})
 			obj[ValueKey] = qs.NameOf(nv)
 			func() {
-				sit := qs.QuadIterator(quad.Subject, nv)
+				sit := qs.QuadIterator(quad.Subject, nv).Iterate()
 				defer sit.Close()
 				for sit.Next(ctx) {
 					q := qs.Quad(sit.Result())
@@ -257,7 +277,7 @@ func iterateObject(ctx context.Context, qs graph.QuadStore, f *field, p *path.Pa
 	tail()
 
 	// first, collect result node ids and any tags associated with it (flat values)
-	it := buildIterator(qs, p)
+	it := buildIterator(ctx, qs, p).Iterate()
 	defer it.Close()
 
 	var results []object
@@ -270,12 +290,12 @@ func iterateObject(ctx context.Context, qs graph.QuadStore, f *field, p *path.Pa
 		if !it.Next(ctx) {
 			break
 		}
-		fields := make(map[string][]graph.Value)
+		fields := make(map[string][]graph.Ref)
 
-		tags := make(map[string]graph.Value)
+		tags := make(map[string]graph.Ref)
 		it.TagResults(tags)
 		for k, v := range tags {
-			fields[k] = []graph.Value{v}
+			fields[k] = []graph.Ref{v}
 		}
 		for it.NextPath(ctx) {
 			select {
@@ -283,13 +303,13 @@ func iterateObject(ctx context.Context, qs graph.QuadStore, f *field, p *path.Pa
 				return out, ctx.Err()
 			default:
 			}
-			tags = make(map[string]graph.Value)
+			tags = make(map[string]graph.Ref)
 			it.TagResults(tags)
 		dedup:
 			for k, v := range tags {
 				vals := fields[k]
 				for _, v2 := range vals {
-					if graph.ToKey(v) == graph.ToKey(v2) {
+					if refs.ToKey(v) == refs.ToKey(v2) {
 						continue dedup
 					}
 				}
@@ -348,6 +368,8 @@ func iterateObject(ctx context.Context, qs graph.QuadStore, f *field, p *path.Pa
 				if len(arr) > 1 {
 					return nil, fmt.Errorf("cannot unnest more than one object on %q; use (%s: 1) to force",
 						f2.Alias, LimitKey)
+				} else if len(arr) == 0 {
+					continue
 				}
 				for k, v := range arr[0] {
 					obj[k] = v

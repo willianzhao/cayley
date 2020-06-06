@@ -27,61 +27,41 @@ import (
 	"fmt"
 	"reflect"
 
-	"github.com/cayleygraph/cayley/quad"
+	"github.com/cayleygraph/cayley/graph/iterator"
+	"github.com/cayleygraph/cayley/graph/refs"
+	"github.com/cayleygraph/quad"
 )
 
-type BatchQuadStore interface {
-	ValuesOf(ctx context.Context, vals []Value) ([]quad.Value, error)
+// Ref defines an opaque "quad store reference" type. However the backend wishes
+// to implement it, a Ref is merely a token to a quad or a node that the
+// backing store itself understands, and the base iterators pass around.
+//
+// For example, in a very traditional, graphd-style graph, these are int64s
+// (guids of the primitives). In a very direct sort of graph, these could be
+// pointers to structs, or merely quads, or whatever works best for the
+// backing store.
+//
+// These must be comparable, or return a comparable version on Key.
+type Ref = refs.Ref
+
+func ValuesOf(ctx context.Context, qs refs.Namer, vals []Ref) ([]quad.Value, error) {
+	return refs.ValuesOf(ctx, qs, vals)
 }
 
-func ValuesOf(ctx context.Context, qs QuadStore, vals []Value) ([]quad.Value, error) {
-	if bq, ok := qs.(BatchQuadStore); ok {
-		return bq.ValuesOf(ctx, vals)
-	}
-	out := make([]quad.Value, len(vals))
-	for i, v := range vals {
-		out[i] = qs.NameOf(v)
-	}
-	return out, nil
+func RefsOf(ctx context.Context, qs refs.Namer, nodes []quad.Value) ([]Ref, error) {
+	return refs.RefsOf(ctx, qs, nodes)
 }
 
-type QuadStore interface {
-	// The only way in is through building a transaction, which
-	// is done by a replication strategy.
-	ApplyDeltas(in []Delta, opts IgnoreOpts) error
-
+type QuadIndexer interface {
 	// Given an opaque token, returns the quad for that token from the store.
-	Quad(Value) quad.Quad
+	Quad(Ref) quad.Quad
 
 	// Given a direction and a token, creates an iterator of links which have
 	// that node token in that directional field.
-	QuadIterator(quad.Direction, Value) Iterator
+	QuadIterator(quad.Direction, Ref) iterator.Shape
 
-	// Returns an iterator enumerating all nodes in the graph.
-	NodesAllIterator() Iterator
-
-	// Returns an iterator enumerating all links in the graph.
-	QuadsAllIterator() Iterator
-
-	// Given a node ID, return the opaque token used by the QuadStore
-	// to represent that id.
-	ValueOf(quad.Value) Value
-
-	// Given an opaque token, return the node that it represents.
-	NameOf(Value) quad.Value
-
-	// Returns the number of quads currently stored.
-	Size() int64
-
-	// Optimize an iterator in the context of the quad store.
-	// Suppose we have a better index for the passed tree; this
-	// gives the QuadStore the opportunity to replace it
-	// with a more efficient iterator.
-	OptimizeIterator(it Iterator) (Iterator, bool)
-
-	// Close the quad store and clean up. (Flush to disk, cleanly
-	// sever connections, etc)
-	Close() error
+	// QuadIteratorSize returns an estimated size of an iterator.
+	QuadIteratorSize(ctx context.Context, d quad.Direction, v Ref) (refs.Size, error)
 
 	// Convenience function for speed. Given a quad token and a direction
 	// return the node token for that direction. Sometimes, a QuadStore
@@ -92,7 +72,42 @@ type QuadStore interface {
 	//
 	//  qs.ValueOf(qs.Quad(id).Get(dir))
 	//
-	QuadDirection(id Value, d quad.Direction) Value
+	QuadDirection(id Ref, d quad.Direction) Ref
+
+	// Stats returns the number of nodes and quads currently stored.
+	// Exact flag controls the correctness of the value. It can be an estimation, or a precise calculation.
+	// The quadstore may have a fast way of retrieving the precise stats, in this case it may ignore 'exact'
+	// flag and always return correct stats (with an appropriate flags set in the output).
+	Stats(ctx context.Context, exact bool) (Stats, error)
+}
+
+// Stats of a graph.
+type Stats struct {
+	Nodes refs.Size // number of nodes
+	Quads refs.Size // number of quads
+}
+
+type QuadStore interface {
+	refs.Namer
+	QuadIndexer
+
+	// The only way in is through building a transaction, which
+	// is done by a replication strategy.
+	ApplyDeltas(in []Delta, opts IgnoreOpts) error
+
+	// NewQuadWriter starts a batch quad import process.
+	// The order of changes is not guaranteed, neither is the order and result of concurrent ApplyDeltas.
+	NewQuadWriter() (quad.WriteCloser, error)
+
+	// Returns an iterator enumerating all nodes in the graph.
+	NodesAllIterator() iterator.Shape
+
+	// Returns an iterator enumerating all links in the graph.
+	QuadsAllIterator() iterator.Shape
+
+	// Close the quad store and clean up. (Flush to disk, cleanly
+	// sever connections, etc)
+	Close() error
 }
 
 type Options map[string]interface{}
@@ -141,10 +156,3 @@ var (
 	ErrDatabaseExists = errors.New("quadstore: cannot init; database already exists")
 	ErrNotInitialized = errors.New("quadstore: not initialized")
 )
-
-type BulkLoader interface {
-	// BulkLoad loads Quads from a quad.Unmarshaler in bulk to the QuadStore.
-	// It returns ErrCannotBulkLoad if bulk loading is not possible. For example if
-	// you cannot load in bulk to a non-empty database, and the db is non-empty.
-	BulkLoad(quad.Reader) error
-}

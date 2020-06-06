@@ -17,17 +17,28 @@ package kv
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
+
+	"github.com/hidal-go/hidalgo/kv"
 
 	"github.com/cayleygraph/cayley/clog"
 	"github.com/cayleygraph/cayley/graph"
 	"github.com/cayleygraph/cayley/graph/proto"
+	"github.com/cayleygraph/cayley/graph/refs"
 	"github.com/cayleygraph/cayley/internal/lru"
-	"github.com/cayleygraph/cayley/quad"
-	"github.com/cayleygraph/cayley/quad/pquads"
+	"github.com/cayleygraph/cayley/query/shape"
+	"github.com/cayleygraph/quad"
+	"github.com/cayleygraph/quad/pquads"
 	boom "github.com/tylertreat/BoomFilters"
+)
+
+var (
+	ErrNoBucket  = errors.New("kv: no bucket")
+	ErrEmptyPath = errors.New("kv: path to the database must be specified")
 )
 
 type Registration struct {
@@ -36,8 +47,8 @@ type Registration struct {
 	IsPersistent bool
 }
 
-type InitFunc func(string, graph.Options) (BucketKV, error)
-type NewFunc func(string, graph.Options) (BucketKV, error)
+type InitFunc func(string, graph.Options) (kv.KV, error)
+type NewFunc func(string, graph.Options) (kv.KV, error)
 
 func Register(name string, r Registration) {
 	graph.RegisterQuadStore(name, graph.QuadStoreRegistration{
@@ -73,14 +84,17 @@ func Register(name string, r Registration) {
 }
 
 const (
-	latestDataVersion = 2
-	nilDataVersion    = 1
+	latestDataVersion   = 2
+	envKVDefaultIndexes = "CAYLEY_KV_INDEXES"
 )
 
-var _ graph.BatchQuadStore = (*QuadStore)(nil)
+var (
+	_ refs.BatchNamer = (*QuadStore)(nil)
+	_ shape.Optimizer = (*QuadStore)(nil)
+)
 
 type QuadStore struct {
-	db BucketKV
+	db kv.KV
 
 	indexes struct {
 		sync.RWMutex
@@ -93,23 +107,33 @@ type QuadStore struct {
 
 	writer    sync.Mutex
 	mapBucket map[string]map[string][]uint64
+	mapBloom  map[string]*boom.BloomFilter
+	mapNodes  *boom.BloomFilter
 
 	exists struct {
+		disabled bool
 		sync.Mutex
 		buf []byte
 		*boom.DeletableBloomFilter
 	}
 }
 
-func newQuadStore(kv BucketKV) *QuadStore {
-	qs := &QuadStore{db: kv}
-	qs.indexes.all = DefaultQuadIndexes
-	return qs
+func newQuadStore(kv kv.KV) *QuadStore {
+	return &QuadStore{db: kv}
 }
 
-func Init(kv BucketKV, opt graph.Options) error {
+func Init(kv kv.KV, opt graph.Options) error {
 	ctx := context.TODO()
 	qs := newQuadStore(kv)
+	if data := os.Getenv(envKVDefaultIndexes); data != "" {
+		qs.indexes.all = nil
+		if err := json.Unmarshal([]byte(data), &qs.indexes); err != nil {
+			return err
+		}
+	}
+	if qs.indexes.all == nil {
+		qs.indexes.all = DefaultQuadIndexes
+	}
 	if _, err := qs.getMetadata(ctx); err == nil {
 		return graph.ErrDatabaseExists
 	} else if err != ErrNoBucket {
@@ -125,10 +149,17 @@ func Init(kv BucketKV, opt graph.Options) error {
 	if err := setVersion(ctx, qs.db, latestDataVersion); err != nil {
 		return err
 	}
+	if err := qs.writeIndexesMeta(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
-func New(kv BucketKV, _ graph.Options) (graph.QuadStore, error) {
+const (
+	OptNoBloom = "no_bloom"
+)
+
+func New(kv kv.KV, opt graph.Options) (graph.QuadStore, error) {
 	ctx := context.TODO()
 	qs := newQuadStore(kv)
 	if vers, err := qs.getMetadata(ctx); err == ErrNoBucket {
@@ -136,21 +167,34 @@ func New(kv BucketKV, _ graph.Options) (graph.QuadStore, error) {
 	} else if err != nil {
 		return nil, err
 	} else if vers != latestDataVersion {
-		return nil, errors.New("kv: data version is out of date. Run cayleyupgrade for your config to update the data.")
+		return nil, errors.New("kv: data version is out of date. Run cayleyupgrade for your config to update the data")
 	}
+	list, err := qs.readIndexesMeta(ctx)
+	if err != nil {
+		return nil, err
+	}
+	qs.indexes.all = list
 	qs.valueLRU = lru.New(2000)
+	qs.exists.disabled, _ = opt.BoolKey(OptNoBloom, false)
 	if err := qs.initBloomFilter(ctx); err != nil {
 		return nil, err
+	}
+	if !qs.exists.disabled {
+		if sz, err := qs.getSize(); err != nil {
+			return nil, err
+		} else if sz == 0 {
+			qs.mapBloom = make(map[string]*boom.BloomFilter)
+			qs.mapNodes = boom.NewBloomFilter(100*1000*1000, 0.05)
+		}
 	}
 	return qs, nil
 }
 
-func setVersion(ctx context.Context, kv BucketKV, version int64) error {
-	return Update(ctx, kv, func(tx BucketTx) error {
+func setVersion(ctx context.Context, db kv.KV, version int64) error {
+	return kv.Update(ctx, db, func(tx kv.Tx) error {
 		var buf [8]byte
 		binary.LittleEndian.PutUint64(buf[:], uint64(version))
-		b := tx.Bucket(metaBucket)
-		if err := b.Put([]byte("version"), buf[:]); err != nil {
+		if err := tx.Put(metaBucket.AppendBytes([]byte("version")), buf[:]); err != nil {
 			return fmt.Errorf("couldn't write version: %v", err)
 		}
 		return nil
@@ -159,18 +203,14 @@ func setVersion(ctx context.Context, kv BucketKV, version int64) error {
 
 func (qs *QuadStore) getMetaInt(ctx context.Context, key string) (int64, error) {
 	var v int64
-	err := View(qs.db, func(tx BucketTx) error {
-		b := tx.Bucket(metaBucket)
-		var err error
-		vals, err := b.Get(ctx, [][]byte{
-			[]byte(key),
-		})
-		if err != nil {
-			return err
-		} else if vals[0] == nil {
+	err := kv.View(qs.db, func(tx kv.Tx) error {
+		val, err := tx.Get(ctx, metaBucket.AppendBytes([]byte(key)))
+		if err == kv.ErrNotFound {
 			return ErrNoBucket
+		} else if err != nil {
+			return err
 		}
-		v, err = asInt64(vals[0], 0)
+		v, err = asInt64(val, 0)
 		if err != nil {
 			return err
 		}
@@ -179,9 +219,48 @@ func (qs *QuadStore) getMetaInt(ctx context.Context, key string) (int64, error) 
 	return v, err
 }
 
+func (qs *QuadStore) getSize() (int64, error) {
+	sz, err := qs.getMetaInt(context.TODO(), "size")
+	if err == ErrNoBucket {
+		return 0, nil
+	}
+	return sz, err
+}
+
 func (qs *QuadStore) Size() int64 {
-	sz, _ := qs.getMetaInt(context.TODO(), "size")
+	sz, _ := qs.getSize()
 	return sz
+}
+
+func (qs *QuadStore) Stats(ctx context.Context, exact bool) (graph.Stats, error) {
+	sz, err := qs.getMetaInt(ctx, "size")
+	if err != nil {
+		return graph.Stats{}, err
+	}
+	st := graph.Stats{
+		Nodes: refs.Size{
+			Value: sz / 3,
+			Exact: false, // TODO(dennwc): store nodes count
+		},
+		Quads: refs.Size{
+			Value: sz,
+			Exact: true,
+		},
+	}
+	if exact {
+		// calculate the exact number of nodes
+		st.Nodes.Value = 0
+		it := qs.NodesAllIterator().Iterate()
+		defer it.Close()
+		for it.Next(ctx) {
+			st.Nodes.Value++
+		}
+		if err := it.Err(); err != nil {
+			return st, err
+		}
+		st.Nodes.Exact = true
+	}
+	return st, nil
 }
 
 func (qs *QuadStore) Close() error {
@@ -190,20 +269,14 @@ func (qs *QuadStore) Close() error {
 
 func (qs *QuadStore) getMetadata(ctx context.Context) (int64, error) {
 	var vers int64
-	err := View(qs.db, func(tx BucketTx) error {
-		b := tx.Bucket(metaBucket)
-		var err error
-		vals, err := b.Get(ctx, [][]byte{
-			[]byte("version"),
-		})
-		if err == ErrNotFound {
+	err := kv.View(qs.db, func(tx kv.Tx) error {
+		val, err := tx.Get(ctx, metaBucket.AppendBytes([]byte("version")))
+		if err == kv.ErrNotFound {
 			return ErrNoBucket
 		} else if err != nil {
 			return err
-		} else if vals[0] == nil {
-			return ErrNoBucket
 		}
-		vers, err = asInt64(vals[0], nilDataVersion)
+		vers, err = asInt64(val, 0)
 		if err != nil {
 			return err
 		}
@@ -227,16 +300,16 @@ func (qs *QuadStore) horizon(ctx context.Context) int64 {
 	return h
 }
 
-func (qs *QuadStore) ValuesOf(ctx context.Context, vals []graph.Value) ([]quad.Value, error) {
+func (qs *QuadStore) ValuesOf(ctx context.Context, vals []graph.Ref) ([]quad.Value, error) {
 	out := make([]quad.Value, len(vals))
 	var (
-		inds []int
-		refs []uint64
+		inds  []int
+		irefs []uint64
 	)
 	for i, v := range vals {
 		if v == nil {
 			continue
-		} else if pv, ok := v.(graph.PreFetchedValue); ok {
+		} else if pv, ok := v.(refs.PreFetchedValue); ok {
 			out[i] = pv.NameOf()
 			continue
 		}
@@ -246,21 +319,21 @@ func (qs *QuadStore) ValuesOf(ctx context.Context, vals []graph.Value) ([]quad.V
 				continue
 			}
 			inds = append(inds, i)
-			refs = append(refs, uint64(v))
+			irefs = append(irefs, uint64(v))
 		default:
-			return out, fmt.Errorf("unknown type of graph.Value; not meant for this quadstore. apparently a %#v", v)
+			return out, fmt.Errorf("unknown type of graph.Ref; not meant for this quadstore. apparently a %#v", v)
 		}
 	}
-	if len(refs) == 0 {
+	if len(irefs) == 0 {
 		return out, nil
 	}
-	prim, err := qs.getPrimitives(ctx, refs)
+	prim, err := qs.getPrimitives(ctx, irefs)
 	if err != nil {
 		return out, err
 	}
 	var last error
 	for i, p := range prim {
-		if !p.IsNode() {
+		if p == nil || !p.IsNode() {
 			continue
 		}
 		qv, err := pquads.UnmarshalValue(p.Value)
@@ -272,9 +345,28 @@ func (qs *QuadStore) ValuesOf(ctx context.Context, vals []graph.Value) ([]quad.V
 	}
 	return out, last
 }
-func (qs *QuadStore) NameOf(v graph.Value) quad.Value {
+
+func (qs *QuadStore) RefsOf(ctx context.Context, nodes []quad.Value) ([]graph.Ref, error) {
+	values := make([]graph.Ref, len(nodes))
+	err := kv.View(qs.db, func(tx kv.Tx) error {
+		for i, node := range nodes {
+			value, err := qs.resolveQuadValue(ctx, tx, node)
+			if err != nil {
+				return err
+			}
+			values[i] = Int64Value(value)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return values, nil
+}
+
+func (qs *QuadStore) NameOf(v graph.Ref) quad.Value {
 	ctx := context.TODO()
-	vals, err := qs.ValuesOf(ctx, []graph.Value{v})
+	vals, err := qs.ValuesOf(ctx, []graph.Ref{v})
 	if err != nil {
 		clog.Errorf("error getting NameOf %d: %s", v, err)
 		return nil
@@ -282,7 +374,7 @@ func (qs *QuadStore) NameOf(v graph.Value) quad.Value {
 	return vals[0]
 }
 
-func (qs *QuadStore) Quad(k graph.Value) quad.Quad {
+func (qs *QuadStore) Quad(k graph.Ref) quad.Quad {
 	key, ok := k.(*proto.Primitive)
 	if !ok {
 		clog.Errorf("passed value was not a quad primitive: %T", k)
@@ -290,13 +382,13 @@ func (qs *QuadStore) Quad(k graph.Value) quad.Quad {
 	}
 	ctx := context.TODO()
 	var v quad.Quad
-	err := View(qs.db, func(tx BucketTx) error {
+	err := kv.View(qs.db, func(tx kv.Tx) error {
 		var err error
 		v, err = qs.primitiveToQuad(ctx, tx, key)
 		return err
 	})
 	if err != nil {
-		if err != ErrNotFound {
+		if err != kv.ErrNotFound {
 			clog.Errorf("error fetching quad %#v: %s", key, err)
 		}
 		return quad.Quad{}
@@ -304,7 +396,7 @@ func (qs *QuadStore) Quad(k graph.Value) quad.Quad {
 	return v
 }
 
-func (qs *QuadStore) primitiveToQuad(ctx context.Context, tx BucketTx, p *proto.Primitive) (quad.Quad, error) {
+func (qs *QuadStore) primitiveToQuad(ctx context.Context, tx kv.Tx, p *proto.Primitive) (quad.Quad, error) {
 	q := &quad.Quad{}
 	for _, dir := range quad.Directions {
 		v := p.GetDirection(dir)
@@ -317,7 +409,7 @@ func (qs *QuadStore) primitiveToQuad(ctx context.Context, tx BucketTx, p *proto.
 	return *q, nil
 }
 
-func (qs *QuadStore) getValFromLog(ctx context.Context, tx BucketTx, k uint64) (quad.Value, error) {
+func (qs *QuadStore) getValFromLog(ctx context.Context, tx kv.Tx, k uint64) (quad.Value, error) {
 	if k == 0 {
 		return nil, nil
 	}
@@ -328,10 +420,10 @@ func (qs *QuadStore) getValFromLog(ctx context.Context, tx BucketTx, k uint64) (
 	return pquads.UnmarshalValue(p.Value)
 }
 
-func (qs *QuadStore) ValueOf(s quad.Value) graph.Value {
+func (qs *QuadStore) ValueOf(s quad.Value) graph.Ref {
 	ctx := context.TODO()
 	var out Int64Value
-	_ = View(qs.db, func(tx BucketTx) error {
+	_ = kv.View(qs.db, func(tx kv.Tx) error {
 		v, err := qs.resolveQuadValue(ctx, tx, s)
 		out = Int64Value(v)
 		return err
@@ -342,7 +434,7 @@ func (qs *QuadStore) ValueOf(s quad.Value) graph.Value {
 	return out
 }
 
-func (qs *QuadStore) QuadDirection(val graph.Value, d quad.Direction) graph.Value {
+func (qs *QuadStore) QuadDirection(val graph.Ref, d quad.Direction) graph.Ref {
 	p, ok := val.(*proto.Primitive)
 	if !ok {
 		return nil
@@ -368,7 +460,8 @@ func (qs *QuadStore) getPrimitives(ctx context.Context, vals []uint64) ([]*proto
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer tx.Close()
+	tx = wrapTx(tx)
 	return qs.getPrimitivesFromLog(ctx, tx, vals)
 }
 

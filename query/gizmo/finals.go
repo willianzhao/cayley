@@ -17,7 +17,8 @@ package gizmo
 import (
 	"github.com/dop251/goja"
 
-	"github.com/cayleygraph/cayley/quad"
+	"github.com/cayleygraph/cayley/graph/iterator"
+	"github.com/cayleygraph/quad"
 )
 
 const TopResultTag = "id"
@@ -25,7 +26,7 @@ const TopResultTag = "id"
 // GetLimit is the same as All, but limited to the first N unique nodes at the end of the path, and each of their possible traversals.
 func (p *pathObject) GetLimit(limit int) error {
 	it := p.buildIteratorTree()
-	it.Tagger().Add(TopResultTag)
+	it = iterator.Tag(it, TopResultTag)
 	p.s.limit = limit
 	p.s.count = 0
 	return p.s.runIterator(it)
@@ -33,7 +34,7 @@ func (p *pathObject) GetLimit(limit int) error {
 
 // All executes the query and adds the results, with all tags, as a string-to-string (tag to node) map in the output set, one for each path that a traversal could take.
 func (p *pathObject) All() error {
-	return p.GetLimit(-1)
+	return p.GetLimit(p.s.limit)
 }
 
 func (p *pathObject) toArray(call goja.FunctionCall, withTags bool) goja.Value {
@@ -46,7 +47,7 @@ func (p *pathObject) toArray(call goja.FunctionCall, withTags bool) goja.Value {
 		limit, _ = toInt(args[0])
 	}
 	it := p.buildIteratorTree()
-	it.Tagger().Add(TopResultTag)
+	it = iterator.Tag(it, TopResultTag)
 	var (
 		array interface{}
 		err   error
@@ -85,7 +86,7 @@ func (p *pathObject) TagArray(call goja.FunctionCall) goja.Value {
 }
 func (p *pathObject) toValue(withTags bool) (interface{}, error) {
 	it := p.buildIteratorTree()
-	it.Tagger().Add(TopResultTag)
+	it = iterator.Tag(it, TopResultTag)
 	const limit = 1
 	if !withTags {
 		array, err := p.s.runIteratorToArrayNoTags(it, limit)
@@ -96,16 +97,15 @@ func (p *pathObject) toValue(withTags bool) (interface{}, error) {
 			return nil, nil
 		}
 		return array[0], nil
-	} else {
-		array, err := p.s.runIteratorToArray(it, limit)
-		if err != nil {
-			return nil, err
-		}
-		if len(array) == 0 {
-			return nil, nil
-		}
-		return array[0], nil
 	}
+	array, err := p.s.runIteratorToArray(it, limit)
+	if err != nil {
+		return nil, err
+	}
+	if len(array) == 0 {
+		return nil, nil
+	}
+	return array[0], nil
 }
 
 // ToValue is the same as ToArray, but limited to one result node.
@@ -137,7 +137,7 @@ func (p *pathObject) Map(call goja.FunctionCall) goja.Value {
 //	graph.V("<alice>").ForEach(function(d) { g.Emit(d) } )
 func (p *pathObject) ForEach(call goja.FunctionCall) goja.Value {
 	it := p.buildIteratorTree()
-	it.Tagger().Add(TopResultTag)
+	it = iterator.Tag(it, TopResultTag)
 	if n := len(call.Arguments); n != 1 && n != 2 {
 		return throwErr(p.s.vm, errArgCount{Got: len(call.Arguments)})
 	}
@@ -159,12 +159,47 @@ func (p *pathObject) ForEach(call goja.FunctionCall) goja.Value {
 // Example:
 //	// javascript
 //	// Save count as a variable
-//	var n = g.V().Count()
+//	var n = g.V().count()
 //	// Send it as a query result
-//	g.Emit(n)
+//	g.emit(n)
 func (p *pathObject) Count() (int64, error) {
 	it := p.buildIteratorTree()
 	return p.s.countResults(it)
+}
+
+// Backwards compatibility
+func (p *pathObject) CapitalizedGetLimit(limit int) error {
+	return p.GetLimit(limit)
+}
+func (p *pathObject) CapitalizedAll() error {
+	return p.All()
+}
+func (p *pathObject) CapitalizedtoArray(call goja.FunctionCall, withTags bool) goja.Value {
+	return p.toArray(call, withTags)
+}
+func (p *pathObject) CapitalizedToArray(call goja.FunctionCall) goja.Value {
+	return p.ToArray(call)
+}
+func (p *pathObject) CapitalizedTagArray(call goja.FunctionCall) goja.Value {
+	return p.TagArray(call)
+}
+func (p *pathObject) CapitalizedtoValue(withTags bool) (interface{}, error) {
+	return p.toValue(withTags)
+}
+func (p *pathObject) CapitalizedToValue() (interface{}, error) {
+	return p.ToValue()
+}
+func (p *pathObject) CapitalizedTagValue() (interface{}, error) {
+	return p.TagValue()
+}
+func (p *pathObject) CapitalizedMap(call goja.FunctionCall) goja.Value {
+	return p.Map(call)
+}
+func (p *pathObject) CapitalizedForEach(call goja.FunctionCall) goja.Value {
+	return p.ForEach(call)
+}
+func (p *pathObject) CapitalizedCount() (int64, error) {
+	return p.Count()
 }
 
 func quadValueToString(v quad.Value) string {
@@ -172,15 +207,4 @@ func quadValueToString(v quad.Value) string {
 		return string(s)
 	}
 	return quad.StringOf(v)
-}
-
-func quadValueToNative(v quad.Value) interface{} {
-	if v == nil {
-		return nil
-	}
-	out := v.Native()
-	if nv, ok := out.(quad.Value); ok && v == nv {
-		return quad.StringOf(v)
-	}
-	return out
 }

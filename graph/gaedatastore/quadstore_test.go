@@ -24,7 +24,7 @@ import (
 	"github.com/cayleygraph/cayley/graph"
 	"github.com/cayleygraph/cayley/graph/graphtest"
 	"github.com/cayleygraph/cayley/graph/graphtest/testutil"
-	"github.com/cayleygraph/cayley/quad"
+	"github.com/cayleygraph/quad"
 	"github.com/stretchr/testify/require"
 
 	"google.golang.org/appengine/aetest"
@@ -58,7 +58,7 @@ type pair struct {
 
 func createInstance() (aetest.Instance, *http.Request, error) {
 	inst, err := aetest.NewInstance(&aetest.Options{
-		AppID: "",
+		AppID:                       "",
 		StronglyConsistentDatastore: true,
 		StartupTimeout:              15 * time.Second,
 	})
@@ -121,12 +121,4 @@ func TestIterators(t *testing.T) {
 	token := &Token{quadKind, key.StringID()}
 
 	require.True(t, it.Contains(token), "Contains failed")
-
-	// Test cloning an iterator
-	var it2 graph.Iterator
-	it2 = it.Clone()
-	x := graph.DescribeIterator(it2)
-	y := graph.DescribeIterator(it)
-
-	require.Equal(t, y.Name, x.Name, "Iterator Clone was not successful")
 }

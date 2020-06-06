@@ -1,13 +1,14 @@
 package sql
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
 	"github.com/cayleygraph/cayley/graph"
 	"github.com/cayleygraph/cayley/graph/iterator"
-	"github.com/cayleygraph/cayley/graph/shape"
-	"github.com/cayleygraph/cayley/quad"
+	"github.com/cayleygraph/cayley/query/shape"
+	"github.com/cayleygraph/quad"
 	"github.com/stretchr/testify/require"
 )
 
@@ -128,7 +129,7 @@ var shapeCases = []struct {
 				quad.Object: {"o1", "o2"},
 				quad.Label:  {"l 1"},
 			},
-			Filter: map[quad.Direction]graph.Value{
+			Filter: map[quad.Direction]graph.Ref{
 				quad.Predicate: sVal("p"),
 			},
 		},
@@ -147,7 +148,7 @@ var shapeCases = []struct {
 					quad.Object: {"o1", "o2"},
 					quad.Label:  {"l 1"},
 				},
-				Filter: map[quad.Direction]graph.Value{
+				Filter: map[quad.Direction]graph.Ref{
 					quad.Predicate: sVal("p"),
 				},
 			},
@@ -165,7 +166,7 @@ var shapeCases = []struct {
 				Dir: quad.Predicate,
 				Values: shape.QuadsAction{
 					Result: quad.Subject,
-					Filter: map[quad.Direction]graph.Value{
+					Filter: map[quad.Direction]graph.Ref{
 						quad.Predicate: sVal("p"),
 					},
 				},
@@ -189,7 +190,7 @@ var shapeCases = []struct {
 						Save: map[quad.Direction][]string{
 							quad.Object: {"ob"},
 						},
-						Filter: map[quad.Direction]graph.Value{
+						Filter: map[quad.Direction]graph.Ref{
 							quad.Predicate: sVal("p"),
 						},
 					},
@@ -211,7 +212,7 @@ var shapeCases = []struct {
 					Limit: 10,
 					From: shape.QuadsAction{
 						Result: quad.Subject,
-						Filter: map[quad.Direction]graph.Value{
+						Filter: map[quad.Direction]graph.Ref{
 							quad.Predicate: sVal("p"),
 						},
 					},
@@ -239,7 +240,7 @@ var shapeCases = []struct {
 							Save: map[quad.Direction][]string{
 								quad.Object: {"ob"},
 							},
-							Filter: map[quad.Direction]graph.Value{
+							Filter: map[quad.Direction]graph.Ref{
 								quad.Predicate: sVal("p"),
 							},
 						},
@@ -263,7 +264,7 @@ var shapeCases = []struct {
 						Save: map[quad.Direction][]string{
 							quad.Object: {"ob"},
 						},
-						Filter: map[quad.Direction]graph.Value{
+						Filter: map[quad.Direction]graph.Ref{
 							quad.Predicate: sVal("p"),
 						},
 					},
@@ -286,7 +287,7 @@ var shapeCases = []struct {
 						quad.Object: {"o1"},
 						quad.Label:  {"l 1"},
 					},
-					Filter: map[quad.Direction]graph.Value{
+					Filter: map[quad.Direction]graph.Ref{
 						quad.Predicate: sVal("p1"),
 					},
 				},
@@ -302,7 +303,7 @@ var shapeCases = []struct {
 							Save: map[quad.Direction][]string{
 								quad.Object: {"ob"},
 							},
-							Filter: map[quad.Direction]graph.Value{
+							Filter: map[quad.Direction]graph.Ref{
 								quad.Predicate: sVal("p2"),
 							},
 						},
@@ -337,7 +338,7 @@ var shapeCases = []struct {
 											Dir: quad.Object,
 											Values: shape.QuadsAction{
 												Result: quad.Subject,
-												Filter: map[quad.Direction]graph.Value{
+												Filter: map[quad.Direction]graph.Ref{
 													quad.Predicate: sVal("n"),
 													quad.Object:    sVal("k"),
 												},
@@ -364,7 +365,7 @@ func TestSQLShapes(t *testing.T) {
 	for _, c := range shapeCases {
 		t.Run(c.name, func(t *testing.T) {
 			opt := NewOptimizer()
-			s, ok := c.s.Optimize(opt)
+			s, ok := c.s.Optimize(context.TODO(), opt)
 			if c.skip {
 				t.Skipf("%#v", s)
 			}

@@ -16,7 +16,7 @@ package writer
 
 import (
 	"github.com/cayleygraph/cayley/graph"
-	"github.com/cayleygraph/cayley/quad"
+	"github.com/cayleygraph/quad"
 )
 
 func init() {
@@ -62,14 +62,11 @@ func (s *Single) AddQuad(q quad.Quad) error {
 }
 
 func (s *Single) AddQuadSet(set []quad.Quad) error {
-	deltas := make([]graph.Delta, len(set))
-	for i, q := range set {
-		deltas[i] = graph.Delta{
-			Quad:   q,
-			Action: graph.Add,
-		}
+	tx := graph.NewTransactionN(len(set))
+	for _, q := range set {
+		tx.AddQuad(q)
 	}
-	return s.qs.ApplyDeltas(deltas, s.ignoreOpts)
+	return s.qs.ApplyDeltas(tx.Deltas, s.ignoreOpts)
 }
 
 func (s *Single) RemoveQuad(q quad.Quad) error {
@@ -95,7 +92,7 @@ func (s *Single) RemoveNode(v quad.Value) error {
 	total := 0
 	// TODO(dennwc): QuadStore may remove node without iterations. Consider optional interface for this.
 	for _, d := range []quad.Direction{quad.Subject, quad.Predicate, quad.Object, quad.Label} {
-		r := graph.NewResultReader(s.qs, s.qs.QuadIterator(d, gv))
+		r := graph.NewResultReader(s.qs, s.qs.QuadIterator(d, gv).Iterate())
 		n, err := quad.Copy(del, r)
 		r.Close()
 		if err != nil {

@@ -16,30 +16,32 @@ package iterator_test
 
 import (
 	"context"
-	"reflect"
 	"sort"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/cayleygraph/cayley/graph"
 	"github.com/cayleygraph/cayley/graph/graphmock"
 	. "github.com/cayleygraph/cayley/graph/iterator"
-	"github.com/cayleygraph/cayley/quad"
+	"github.com/cayleygraph/cayley/graph/refs"
+	"github.com/cayleygraph/quad"
 )
 
-func singleHop(pred string) graph.ApplyMorphism {
-	return func(qs graph.QuadStore, it graph.Iterator) graph.Iterator {
+func singleHop(qs graph.QuadIndexer, pred string) Morphism {
+	return func(it Shape) Shape {
 		fixed := NewFixed()
-		fixed.Add(graph.PreFetched(quad.Raw(pred)))
-		predlto := NewLinksTo(qs, fixed, quad.Predicate)
-		lto := NewLinksTo(qs, it.Clone(), quad.Subject)
-		and := NewAnd(qs)
+		fixed.Add(refs.PreFetched(quad.Raw(pred)))
+		predlto := graph.NewLinksTo(qs, fixed, quad.Predicate)
+		lto := graph.NewLinksTo(qs, it, quad.Subject)
+		and := NewAnd()
 		and.AddSubIterator(lto)
 		and.AddSubIterator(predlto)
-		return NewHasA(qs, and, quad.Object)
+		return graph.NewHasA(qs, and, quad.Object)
 	}
 }
 
-var rec_test_qs = &graphmock.Store{
+var recTestQs = &graphmock.Store{
 	Data: []quad.Quad{
 		quad.MakeRaw("alice", "parent", "bob", ""),
 		quad.MakeRaw("bob", "parent", "charlie", ""),
@@ -53,68 +55,62 @@ var rec_test_qs = &graphmock.Store{
 
 func TestRecursiveNext(t *testing.T) {
 	ctx := context.TODO()
-	qs := rec_test_qs
+	qs := recTestQs
 	start := NewFixed()
-	start.Add(graph.PreFetched(quad.Raw("alice")))
-	r := NewRecursive(qs, start, singleHop("parent"), 0)
-	expected := []string{"bob", "charlie", "dani", "emily"}
+	start.Add(refs.PreFetched(quad.Raw("alice")))
+	r := NewRecursive(start, singleHop(qs, "parent"), 0).Iterate()
 
+	expected := []string{"bob", "charlie", "dani", "emily"}
 	var got []string
 	for r.Next(ctx) {
 		got = append(got, quad.ToString(qs.NameOf(r.Result())))
 	}
 	sort.Strings(expected)
 	sort.Strings(got)
-	if !reflect.DeepEqual(got, expected) {
-		t.Errorf("Failed to %s, got: %v, expected: %v", "check basic recursive iterator", got, expected)
-	}
+	require.Equal(t, expected, got)
 }
 
 func TestRecursiveContains(t *testing.T) {
 	ctx := context.TODO()
-	qs := rec_test_qs
+	qs := recTestQs
 	start := NewFixed()
-	start.Add(graph.PreFetched(quad.Raw("alice")))
-	r := NewRecursive(qs, start, singleHop("parent"), 0)
+	start.Add(refs.PreFetched(quad.Raw("alice")))
+	r := NewRecursive(start, singleHop(qs, "parent"), 0).Lookup()
 	values := []string{"charlie", "bob", "not"}
 	expected := []bool{true, true, false}
 
 	for i, v := range values {
 		ok := r.Contains(ctx, qs.ValueOf(quad.Raw(v)))
-		if expected[i] != ok {
-			t.Errorf("Failed to %s, value: %s, got: %v, expected: %v", "check basic recursive contains", v, ok, expected[i])
-		}
+		require.Equal(t, expected[i], ok)
 	}
 }
 
 func TestRecursiveNextPath(t *testing.T) {
 	ctx := context.TODO()
-	qs := rec_test_qs
+	qs := recTestQs
 	start := qs.NodesAllIterator()
-	start.Tagger().Add("person")
-	it := singleHop("follows")(qs, start)
-	and := NewAnd(qs)
+	start = Tag(start, "person")
+	it := singleHop(qs, "follows")(start)
+	and := NewAnd()
 	and.AddSubIterator(it)
 	fixed := NewFixed()
-	fixed.Add(graph.PreFetched(quad.Raw("alice")))
+	fixed.Add(refs.PreFetched(quad.Raw("alice")))
 	and.AddSubIterator(fixed)
-	r := NewRecursive(qs, and, singleHop("parent"), 0)
+	r := NewRecursive(and, singleHop(qs, "parent"), 0).Iterate()
 
 	expected := []string{"fred", "fred", "fred", "fred", "greg", "greg", "greg", "greg"}
 	var got []string
 	for r.Next(ctx) {
-		res := make(map[string]graph.Value)
+		res := make(map[string]refs.Ref)
 		r.TagResults(res)
 		got = append(got, quad.ToString(qs.NameOf(res["person"])))
 		for r.NextPath(ctx) {
-			res := make(map[string]graph.Value)
+			res := make(map[string]refs.Ref)
 			r.TagResults(res)
 			got = append(got, quad.ToString(qs.NameOf(res["person"])))
 		}
 	}
 	sort.Strings(expected)
 	sort.Strings(got)
-	if !reflect.DeepEqual(got, expected) {
-		t.Errorf("Failed to check NextPath, got: %v, expected: %v", got, expected)
-	}
+	require.Equal(t, expected, got)
 }

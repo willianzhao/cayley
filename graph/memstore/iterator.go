@@ -22,30 +22,19 @@ import (
 
 	"github.com/cayleygraph/cayley/graph"
 	"github.com/cayleygraph/cayley/graph/iterator"
-	"github.com/cayleygraph/cayley/quad"
+	"github.com/cayleygraph/cayley/graph/refs"
+	"github.com/cayleygraph/quad"
 )
 
-var _ graph.Iterator = &Iterator{}
-
 type Iterator struct {
-	nodes bool
-	uid   uint64
 	qs    *QuadStore
-	tags  graph.Tagger
 	tree  *Tree
-
-	iter *Enumerator
-	cur  *primitive
-	err  error
-
 	d     quad.Direction
 	value int64
 }
 
-func NewIterator(tree *Tree, qs *QuadStore, d quad.Direction, value int64) *Iterator {
+func (qs *QuadStore) newIterator(tree *Tree, d quad.Direction, value int64) *Iterator {
 	return &Iterator{
-		nodes: d == 0,
-		uid:   iterator.NextUID(),
 		qs:    qs,
 		tree:  tree,
 		d:     d,
@@ -53,43 +42,74 @@ func NewIterator(tree *Tree, qs *QuadStore, d quad.Direction, value int64) *Iter
 	}
 }
 
-func (it *Iterator) UID() uint64 {
-	return it.uid
+func (it *Iterator) Iterate() iterator.Scanner {
+	// TODO(dennwc): it doesn't check the direction and value, while Contains does; is it expected?
+	return it.qs.newIteratorNext(it.tree, it.d)
 }
 
-func (it *Iterator) Reset() {
-	it.iter = nil
-	it.err = nil
-	it.cur = nil
+func (it *Iterator) Lookup() iterator.Index {
+	return it.qs.newIteratorContains(it.tree, it.d, it.value)
 }
 
-func (it *Iterator) Tagger() *graph.Tagger {
-	return &it.tags
-}
-
-func (it *Iterator) TagResults(dst map[string]graph.Value) {
-	it.tags.TagResult(dst, it.Result())
-}
-
-func (it *Iterator) Clone() graph.Iterator {
-	m := NewIterator(it.tree, it.qs, it.d, it.value)
-	m.tags.CopyFrom(it)
-	return m
-}
-
-func (it *Iterator) Close() error {
+func (it *Iterator) SubIterators() []iterator.Shape {
 	return nil
 }
 
-func (it *Iterator) Next(ctx context.Context) bool {
-	graph.NextLogIn(it)
+func (it *Iterator) String() string {
+	return fmt.Sprintf("MemStore(%v)", it.d)
+}
+
+func (it *Iterator) Sorted() bool { return true }
+
+func (it *Iterator) Optimize(ctx context.Context) (iterator.Shape, bool) {
+	return it, false
+}
+
+func (it *Iterator) Stats(ctx context.Context) (iterator.Costs, error) {
+	return iterator.Costs{
+		ContainsCost: int64(math.Log(float64(it.tree.Len()))) + 1,
+		NextCost:     1,
+		Size: refs.Size{
+			Value: int64(it.tree.Len()),
+			Exact: true,
+		},
+	}, nil
+}
+
+type iteratorNext struct {
+	nodes bool
+	qs    *QuadStore
+	tree  *Tree
+	d     quad.Direction
+
+	iter *Enumerator
+	cur  *Primitive
+	err  error
+}
+
+func (qs *QuadStore) newIteratorNext(tree *Tree, d quad.Direction) *iteratorNext {
+	return &iteratorNext{
+		nodes: d == 0,
+		d:     d,
+		qs:    qs,
+		tree:  tree,
+	}
+}
+
+func (it *iteratorNext) TagResults(dst map[string]graph.Ref) {}
+
+func (it *iteratorNext) Close() error {
+	return nil
+}
+
+func (it *iteratorNext) Next(ctx context.Context) bool {
 	if it.iter == nil {
 		it.iter, it.err = it.tree.SeekFirst()
 		if it.err == io.EOF || it.iter == nil {
 			it.err = nil
-			return graph.NextLogOut(it, false)
+			return false
 		} else if it.err != nil {
-			return graph.NextLogOut(it, false)
+			return false
 		}
 	}
 	for {
@@ -98,74 +118,97 @@ func (it *Iterator) Next(ctx context.Context) bool {
 			if err != io.EOF {
 				it.err = err
 			}
-			return graph.NextLogOut(it, false)
+			return false
 		}
 		it.cur = p
-		return graph.NextLogOut(it, true)
+		return true
 	}
 }
 
-func (it *Iterator) Err() error {
+func (it *iteratorNext) Err() error {
 	return it.err
 }
 
-func (it *Iterator) Result() graph.Value {
+func (it *iteratorNext) Result() graph.Ref {
 	if it.cur == nil {
 		return nil
 	}
 	return qprim{p: it.cur}
 }
 
-func (it *Iterator) NextPath(ctx context.Context) bool {
+func (it *iteratorNext) NextPath(ctx context.Context) bool {
 	return false
 }
 
-// No subiterators.
-func (it *Iterator) SubIterators() []graph.Iterator {
+func (it *iteratorNext) String() string {
+	return fmt.Sprintf("MemStoreNext(%v)", it.d)
+}
+
+func (it *iteratorNext) Sorted() bool { return true }
+
+type iteratorContains struct {
+	nodes bool
+	qs    *QuadStore
+	tree  *Tree
+
+	cur *Primitive
+
+	d     quad.Direction
+	value int64
+}
+
+func (qs *QuadStore) newIteratorContains(tree *Tree, d quad.Direction, value int64) *iteratorContains {
+	return &iteratorContains{
+		nodes: d == 0,
+		qs:    qs,
+		tree:  tree,
+		d:     d,
+		value: value,
+	}
+}
+
+func (it *iteratorContains) TagResults(dst map[string]graph.Ref) {}
+
+func (it *iteratorContains) Close() error {
 	return nil
 }
 
-func (it *Iterator) Size() (int64, bool) {
-	return int64(it.tree.Len()), true
+func (it *iteratorContains) Err() error {
+	return nil
 }
 
-func (it *Iterator) Contains(ctx context.Context, v graph.Value) bool {
-	graph.ContainsLogIn(it, v)
+func (it *iteratorContains) Result() graph.Ref {
+	if it.cur == nil {
+		return nil
+	}
+	return qprim{p: it.cur}
+}
+
+func (it *iteratorContains) NextPath(ctx context.Context) bool {
+	return false
+}
+
+func (it *iteratorContains) Contains(ctx context.Context, v graph.Ref) bool {
 	if v == nil {
-		return graph.ContainsLogOut(it, v, false)
+		return false
 	}
 	switch v := v.(type) {
 	case bnode:
 		if p, ok := it.tree.Get(int64(v)); ok {
 			it.cur = p
-			return graph.ContainsLogOut(it, v, true)
+			return true
 		}
 	case qprim:
 		if v.p.Quad.Dir(it.d) == it.value {
 			it.cur = v.p
-			return graph.ContainsLogOut(it, v, true)
+			return true
 		}
 	}
-	return graph.ContainsLogOut(it, v, false)
+	return false
 }
 
-func (it *Iterator) String() string {
-	return fmt.Sprintf("MemStore(%v)", it.d)
+func (it *iteratorContains) String() string {
+	return fmt.Sprintf("MemStoreContains(%v)", it.d)
 }
 
-func (it *Iterator) Type() graph.Type { return "b+tree" }
-
-func (it *Iterator) Sorted() bool { return true }
-
-func (it *Iterator) Optimize() (graph.Iterator, bool) {
-	return it, false
-}
-
-func (it *Iterator) Stats() graph.IteratorStats {
-	return graph.IteratorStats{
-		ContainsCost: int64(math.Log(float64(it.tree.Len()))) + 1,
-		NextCost:     1,
-		Size:         int64(it.tree.Len()),
-		ExactSize:    true,
-	}
-}
+func (it *iteratorContains) Sorted() bool { return true }

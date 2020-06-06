@@ -18,23 +18,90 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/hidal-go/hidalgo/kv"
+
 	"github.com/cayleygraph/cayley/graph"
 	"github.com/cayleygraph/cayley/graph/iterator"
 	"github.com/cayleygraph/cayley/graph/proto"
+	"github.com/cayleygraph/cayley/graph/refs"
 )
 
 type QuadIterator struct {
-	uid     uint64
-	tags    graph.Tagger
-	qs      *QuadStore
-	ind     QuadIndex
-	horizon int64
-	vals    []uint64
-	size    int64
+	qs   *QuadStore
+	ind  QuadIndex
+	vals []uint64
 
-	tx   BucketTx
-	b    Bucket
-	it   KVIterator
+	size refs.Size
+	err  error
+}
+
+func (qs *QuadStore) newQuadIterator(ind QuadIndex, vals []uint64) *QuadIterator {
+	return &QuadIterator{
+		qs:   qs,
+		ind:  ind,
+		vals: vals,
+		size: refs.Size{Value: -1},
+	}
+}
+
+func (it *QuadIterator) Iterate() iterator.Scanner {
+	return it.qs.newQuadIteratorNext(it.ind, it.vals)
+}
+
+func (it *QuadIterator) Lookup() iterator.Index {
+	return it.qs.newQuadIteratorContains(it.ind, it.vals)
+}
+
+func (it *QuadIterator) SubIterators() []iterator.Shape {
+	return nil
+}
+
+func (it *QuadIterator) getSize(ctx context.Context) (refs.Size, error) {
+	if it.err != nil {
+		return refs.Size{}, it.err
+	} else if it.size.Value >= 0 {
+		return it.size, nil
+	}
+	if len(it.ind.Dirs) == len(it.vals) {
+		sz, err := it.qs.indexSize(ctx, it.ind, it.vals)
+		if err != nil {
+			it.err = err
+			return refs.Size{}, it.err
+		}
+		it.size = sz
+		return sz, nil
+	}
+	sz := refs.Size{Value: 1 + it.qs.Size()/2, Exact: false}
+	it.size = sz
+	return sz, nil
+}
+
+func (it *QuadIterator) String() string {
+	return fmt.Sprintf("KVQuads(%v)", it.ind)
+}
+
+func (it *QuadIterator) Sorted() bool { return true }
+
+func (it *QuadIterator) Optimize(ctx context.Context) (iterator.Shape, bool) {
+	return it, false
+}
+
+func (it *QuadIterator) Stats(ctx context.Context) (iterator.Costs, error) {
+	s, err := it.getSize(ctx)
+	return iterator.Costs{
+		ContainsCost: 1,
+		NextCost:     2,
+		Size:         s,
+	}, err
+}
+
+type quadIteratorNext struct {
+	qs   *QuadStore
+	ind  QuadIndex
+	vals []uint64
+
+	tx   kv.Tx
+	it   kv.Iterator
 	done bool
 
 	err  error
@@ -44,77 +111,42 @@ type QuadIterator struct {
 	prim *proto.Primitive
 }
 
-var _ graph.Iterator = &QuadIterator{}
-
-func NewQuadIterator(qs *QuadStore, ind QuadIndex, vals []uint64) *QuadIterator {
-	return &QuadIterator{
-		qs:      qs,
-		ind:     ind,
-		horizon: qs.horizon(context.TODO()),
-		uid:     iterator.NextUID(),
-		vals:    vals,
-		size:    -1,
+func (qs *QuadStore) newQuadIteratorNext(ind QuadIndex, vals []uint64) *quadIteratorNext {
+	return &quadIteratorNext{
+		qs:   qs,
+		ind:  ind,
+		vals: vals,
 	}
 }
 
-func (it *QuadIterator) UID() uint64 {
-	return it.uid
-}
+func (it *quadIteratorNext) TagResults(dst map[string]graph.Ref) {}
 
-func (it *QuadIterator) Reset() {
-	it.off = 0
-	it.ids = nil
-	it.buf = nil
-	it.done = false
-	if it.it != nil {
-		it.it.Close()
-		it.it = it.b.Scan(it.ind.Key(it.vals))
-	}
-}
-
-func (it *QuadIterator) Tagger() *graph.Tagger {
-	return &it.tags
-}
-
-func (it *QuadIterator) TagResults(dst map[string]graph.Value) {
-	it.tags.TagResult(dst, it.Result())
-}
-
-func (it *QuadIterator) Clone() graph.Iterator {
-	out := NewQuadIterator(it.qs, it.ind, it.vals)
-	out.tags.CopyFrom(it)
-	out.ids = it.ids
-	out.horizon = it.horizon
-	return out
-}
-
-func (it *QuadIterator) Close() error {
+func (it *quadIteratorNext) Close() error {
 	if it.it != nil {
 		if err := it.it.Close(); err != nil && it.err == nil {
 			it.err = err
 		}
-		if err := it.tx.Rollback(); err != nil && it.err == nil {
+		if err := it.tx.Close(); err != nil && it.err == nil {
 			it.err = err
 		}
 		it.it = nil
 		it.tx = nil
-		it.b = nil
 	}
 	return it.err
 }
 
-func (it *QuadIterator) Err() error {
+func (it *quadIteratorNext) Err() error {
 	return it.err
 }
 
-func (it *QuadIterator) Result() graph.Value {
+func (it *quadIteratorNext) Result() graph.Ref {
 	if it.off < 0 || it.prim == nil {
 		return nil
 	}
 	return it.prim
 }
 
-func (it *QuadIterator) ensureTx() bool {
+func (it *quadIteratorNext) ensureTx() bool {
 	if it.tx != nil {
 		return true
 	}
@@ -122,11 +154,11 @@ func (it *QuadIterator) ensureTx() bool {
 	if it.err != nil {
 		return false
 	}
-	it.b = it.tx.Bucket(it.ind.Bucket())
+	it.tx = wrapTx(it.tx)
 	return true
 }
 
-func (it *QuadIterator) Next(ctx context.Context) bool {
+func (it *quadIteratorNext) Next(ctx context.Context) bool {
 	it.prim = nil
 	if it.err != nil || it.done {
 		return false
@@ -135,7 +167,7 @@ func (it *QuadIterator) Next(ctx context.Context) bool {
 		if !it.ensureTx() {
 			return false
 		}
-		it.it = it.b.Scan(it.ind.Key(it.vals))
+		it.it = it.tx.Scan(it.ind.Key(it.vals))
 		if err := it.Err(); err != nil {
 			it.err = err
 			return false
@@ -173,18 +205,64 @@ func (it *QuadIterator) Next(ctx context.Context) bool {
 			if p == nil || p.Deleted {
 				continue
 			}
+			// TODO(dennwc): shouldn't this check the horizon?
 			it.prim = p
 			return true
 		}
 	}
 }
 
-func (it *QuadIterator) NextPath(ctx context.Context) bool {
+func (it *quadIteratorNext) NextPath(ctx context.Context) bool {
 	return false
 }
 
-func (it *QuadIterator) Contains(ctx context.Context, v graph.Value) bool {
+func (it *quadIteratorNext) String() string {
+	return fmt.Sprintf("KVQuadsNext(%v)", it.ind)
+}
+
+func (it *quadIteratorNext) Sorted() bool { return true }
+
+type quadIteratorContains struct {
+	qs   *QuadStore
+	ind  QuadIndex
+	vals []uint64
+
+	err  error
+	prim *proto.Primitive
+}
+
+func (qs *QuadStore) newQuadIteratorContains(ind QuadIndex, vals []uint64) *quadIteratorContains {
+	return &quadIteratorContains{
+		qs:   qs,
+		ind:  ind,
+		vals: vals,
+	}
+}
+
+func (it *quadIteratorContains) TagResults(dst map[string]graph.Ref) {}
+
+func (it *quadIteratorContains) Close() error {
+	return it.err
+}
+
+func (it *quadIteratorContains) Err() error {
+	return it.err
+}
+
+func (it *quadIteratorContains) Result() graph.Ref {
+	if it.prim == nil {
+		return nil
+	}
+	return it.prim
+}
+
+func (it *quadIteratorContains) NextPath(ctx context.Context) bool {
+	return false
+}
+
+func (it *quadIteratorContains) Contains(ctx context.Context, v graph.Ref) bool {
 	it.prim = nil
+	// TODO(dennwc): shouldn't this check the horizon?
 	p, ok := v.(*proto.Primitive)
 	if !ok {
 		return false
@@ -194,60 +272,12 @@ func (it *QuadIterator) Contains(ctx context.Context, v graph.Value) bool {
 			return false
 		}
 	}
+	it.prim = p
 	return true
 }
 
-func (it *QuadIterator) SubIterators() []graph.Iterator {
-	return nil
+func (it *quadIteratorContains) String() string {
+	return fmt.Sprintf("KVQuadsContains(%v)", it.ind)
 }
 
-func (it *QuadIterator) Size() (int64, bool) {
-	if it.err != nil {
-		return 0, false
-	} else if it.size >= 0 {
-		return it.size, true
-	}
-	ctx := context.TODO()
-	if len(it.ind.Dirs) == len(it.vals) {
-		var ids []uint64
-		it.err = View(it.qs.db, func(tx BucketTx) error {
-			b := tx.Bucket(it.ind.Bucket())
-			vals, err := b.Get(ctx, [][]byte{it.ind.Key(it.vals)})
-			if err != nil {
-				return err
-			}
-			ids, err = decodeIndex(vals[0])
-			if err != nil {
-				return err
-			}
-			return nil
-		})
-		if it.err != nil {
-			return 0, false
-		}
-		it.size = int64(len(ids))
-		return it.size, true
-	}
-	return 1 + it.qs.Size()/2, false
-}
-
-func (it *QuadIterator) String() string {
-	return fmt.Sprintf("KVQuads(%v)", it.ind)
-}
-
-func (it *QuadIterator) Type() graph.Type { return "kv_quad" }
-func (it *QuadIterator) Sorted() bool     { return true }
-
-func (it *QuadIterator) Optimize() (graph.Iterator, bool) {
-	return it, false
-}
-
-func (it *QuadIterator) Stats() graph.IteratorStats {
-	s, exact := it.Size()
-	return graph.IteratorStats{
-		ContainsCost: 1,
-		NextCost:     2,
-		Size:         s,
-		ExactSize:    exact,
-	}
-}
+func (it *quadIteratorContains) Sorted() bool { return true }

@@ -11,12 +11,12 @@ import (
 	"github.com/cayleygraph/cayley"
 	"github.com/cayleygraph/cayley/graph"
 	_ "github.com/cayleygraph/cayley/graph/kv/bolt"
-	"github.com/cayleygraph/cayley/quad"
 	"github.com/cayleygraph/cayley/schema"
-	"github.com/cayleygraph/cayley/voc"
+	"github.com/cayleygraph/quad"
+	"github.com/cayleygraph/quad/voc"
 
 	// Import RDF vocabulary definitions to be able to expand IRIs like rdf:label.
-	_ "github.com/cayleygraph/cayley/voc/core"
+	_ "github.com/cayleygraph/quad/voc/core"
 )
 
 type Person struct {
@@ -57,16 +57,17 @@ func main() {
 	}
 
 	// File for your new BoltDB. Use path to regular file and not temporary in the real world
-	tmpfile, err := ioutil.TempFile("", "example")
+	tmpdir, err := ioutil.TempDir("", "example")
 	checkErr(err)
 
-	defer os.Remove(tmpfile.Name()) // clean up
+	defer os.RemoveAll(tmpdir) // clean up
 
 	// Initialize the database
-	graph.InitQuadStore("bolt", tmpfile.Name(), nil)
+	err = graph.InitQuadStore("bolt", tmpdir, nil)
+	checkErr(err)
 
 	// Open and use the database
-	store, err := cayley.NewGraph("bolt", tmpfile.Name(), nil)
+	store, err := cayley.NewGraph("bolt", tmpdir, nil)
 	checkErr(err)
 	defer store.Close()
 	qw := graph.NewWriter(store)
@@ -121,7 +122,8 @@ func main() {
 	// Print quads
 	fmt.Println("\nquads:")
 	ctx := context.TODO()
-	it := store.QuadsAllIterator()
+	it := store.QuadsAllIterator().Iterate()
+	defer it.Close()
 	for it.Next(ctx) {
 		fmt.Println(store.Quad(it.Result()))
 	}

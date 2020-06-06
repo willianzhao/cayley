@@ -3,117 +3,36 @@ package iterator
 import (
 	"context"
 
-	"github.com/cayleygraph/cayley/graph"
+	"github.com/cayleygraph/cayley/graph/refs"
 )
-
-var _ graph.Iterator = &Unique{}
 
 // Unique iterator removes duplicate values from it's subiterator.
 type Unique struct {
-	uid      uint64
-	tags     graph.Tagger
-	subIt    graph.Iterator
-	result   graph.Value
-	runstats graph.IteratorStats
-	err      error
-	seen     map[interface{}]bool
+	subIt Shape
 }
 
-func NewUnique(subIt graph.Iterator) *Unique {
+func NewUnique(subIt Shape) *Unique {
 	return &Unique{
-		uid:   NextUID(),
 		subIt: subIt,
-		seen:  make(map[interface{}]bool),
 	}
 }
 
-func (it *Unique) UID() uint64 {
-	return it.uid
+func (it *Unique) Iterate() Scanner {
+	return newUniqueNext(it.subIt.Iterate())
 }
 
-// Reset resets the internal iterators and the iterator itself.
-func (it *Unique) Reset() {
-	it.result = nil
-	it.subIt.Reset()
-	it.seen = make(map[interface{}]bool)
-}
-
-func (it *Unique) Tagger() *graph.Tagger {
-	return &it.tags
-}
-
-func (it *Unique) TagResults(dst map[string]graph.Value) {
-	it.tags.TagResult(dst, it.Result())
-
-	if it.subIt != nil {
-		it.subIt.TagResults(dst)
-	}
-}
-
-func (it *Unique) Clone() graph.Iterator {
-	uniq := NewUnique(it.subIt.Clone())
-	uniq.tags.CopyFrom(it)
-	return uniq
+func (it *Unique) Lookup() Index {
+	return newUniqueContains(it.subIt.Lookup())
 }
 
 // SubIterators returns a slice of the sub iterators. The first iterator is the
 // primary iterator, for which the complement is generated.
-func (it *Unique) SubIterators() []graph.Iterator {
-	return []graph.Iterator{it.subIt}
+func (it *Unique) SubIterators() []Shape {
+	return []Shape{it.subIt}
 }
 
-// Next advances the subiterator, continuing until it returns a value which it
-// has not previously seen.
-func (it *Unique) Next(ctx context.Context) bool {
-	graph.NextLogIn(it)
-	it.runstats.Next += 1
-
-	for it.subIt.Next(ctx) {
-		curr := it.subIt.Result()
-		key := graph.ToKey(curr)
-		if ok := it.seen[key]; !ok {
-			it.result = curr
-			it.seen[key] = true
-			return graph.NextLogOut(it, true)
-		}
-	}
-	it.err = it.subIt.Err()
-	return graph.NextLogOut(it, false)
-}
-
-func (it *Unique) Err() error {
-	return it.err
-}
-
-func (it *Unique) Result() graph.Value {
-	return it.result
-}
-
-// Contains checks whether the passed value is part of the primary iterator,
-// which is irrelevant for uniqueness.
-func (it *Unique) Contains(ctx context.Context, val graph.Value) bool {
-	graph.ContainsLogIn(it, val)
-	it.runstats.Contains += 1
-	return graph.ContainsLogOut(it, val, it.subIt.Contains(ctx, val))
-}
-
-// NextPath for unique always returns false. If we were to return multiple
-// paths, we'd no longer be a unique result, so we have to choose only the first
-// path that got us here. Unique is serious on this point.
-func (it *Unique) NextPath(ctx context.Context) bool {
-	return false
-}
-
-// Close closes the primary iterators.
-func (it *Unique) Close() error {
-	it.seen = nil
-	return it.subIt.Close()
-}
-
-func (it *Unique) Type() graph.Type { return graph.Unique }
-
-func (it *Unique) Optimize() (graph.Iterator, bool) {
-	newIt, optimized := it.subIt.Optimize()
+func (it *Unique) Optimize(ctx context.Context) (Shape, bool) {
+	newIt, optimized := it.subIt.Optimize(ctx)
 	if optimized {
 		it.subIt = newIt
 	}
@@ -122,24 +41,127 @@ func (it *Unique) Optimize() (graph.Iterator, bool) {
 
 const uniquenessFactor = 2
 
-func (it *Unique) Stats() graph.IteratorStats {
-	subStats := it.subIt.Stats()
-	return graph.IteratorStats{
+func (it *Unique) Stats(ctx context.Context) (Costs, error) {
+	subStats, err := it.subIt.Stats(ctx)
+	return Costs{
 		NextCost:     subStats.NextCost * uniquenessFactor,
 		ContainsCost: subStats.ContainsCost,
-		Size:         subStats.Size / uniquenessFactor,
-		ExactSize:    false,
-		Next:         it.runstats.Next,
-		Contains:     it.runstats.Contains,
-		ContainsNext: it.runstats.ContainsNext,
-	}
-}
-
-func (it *Unique) Size() (int64, bool) {
-	st := it.Stats()
-	return st.Size, st.ExactSize
+		Size: refs.Size{
+			Value: subStats.Size.Value / uniquenessFactor,
+			Exact: false,
+		},
+	}, err
 }
 
 func (it *Unique) String() string {
 	return "Unique"
+}
+
+// Unique iterator removes duplicate values from it's subiterator.
+type uniqueNext struct {
+	subIt  Scanner
+	result refs.Ref
+	err    error
+	seen   map[interface{}]bool
+}
+
+func newUniqueNext(subIt Scanner) *uniqueNext {
+	return &uniqueNext{
+		subIt: subIt,
+		seen:  make(map[interface{}]bool),
+	}
+}
+
+func (it *uniqueNext) TagResults(dst map[string]refs.Ref) {
+	if it.subIt != nil {
+		it.subIt.TagResults(dst)
+	}
+}
+
+// Next advances the subiterator, continuing until it returns a value which it
+// has not previously seen.
+func (it *uniqueNext) Next(ctx context.Context) bool {
+	for it.subIt.Next(ctx) {
+		curr := it.subIt.Result()
+		key := refs.ToKey(curr)
+		if ok := it.seen[key]; !ok {
+			it.result = curr
+			it.seen[key] = true
+			return true
+		}
+	}
+	it.err = it.subIt.Err()
+	return false
+}
+
+func (it *uniqueNext) Err() error {
+	return it.err
+}
+
+func (it *uniqueNext) Result() refs.Ref {
+	return it.result
+}
+
+// NextPath for unique always returns false. If we were to return multiple
+// paths, we'd no longer be a unique result, so we have to choose only the first
+// path that got us here. Unique is serious on this point.
+func (it *uniqueNext) NextPath(ctx context.Context) bool {
+	return false
+}
+
+// Close closes the primary iterators.
+func (it *uniqueNext) Close() error {
+	it.seen = nil
+	return it.subIt.Close()
+}
+
+func (it *uniqueNext) String() string {
+	return "UniqueNext"
+}
+
+// Unique iterator removes duplicate values from it's subiterator.
+type uniqueContains struct {
+	subIt Index
+}
+
+func newUniqueContains(subIt Index) *uniqueContains {
+	return &uniqueContains{
+		subIt: subIt,
+	}
+}
+
+func (it *uniqueContains) TagResults(dst map[string]refs.Ref) {
+	if it.subIt != nil {
+		it.subIt.TagResults(dst)
+	}
+}
+
+func (it *uniqueContains) Err() error {
+	return it.subIt.Err()
+}
+
+func (it *uniqueContains) Result() refs.Ref {
+	return it.subIt.Result()
+}
+
+// Contains checks whether the passed value is part of the primary iterator,
+// which is irrelevant for uniqueness.
+func (it *uniqueContains) Contains(ctx context.Context, val refs.Ref) bool {
+	return it.subIt.Contains(ctx, val)
+}
+
+// NextPath for unique always returns false. If we were to return multiple
+// paths, we'd no longer be a unique result, so we have to choose only the first
+// path that got us here. Unique is serious on this point.
+func (it *uniqueContains) NextPath(ctx context.Context) bool {
+	return false
+}
+
+// Close closes the primary iterators.
+func (it *uniqueContains) Close() error {
+	return it.subIt.Close()
+}
+
+func (it *uniqueContains) String() string {
+	return "UniqueContains"
 }

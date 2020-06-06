@@ -19,56 +19,88 @@ import (
 
 	"github.com/cayleygraph/cayley/graph"
 	"github.com/cayleygraph/cayley/graph/iterator"
+	"github.com/cayleygraph/cayley/graph/refs"
 )
 
-var _ graph.Iterator = (*AllIterator)(nil)
+var _ iterator.Shape = (*allIterator)(nil)
 
-type AllIterator struct {
-	uid  uint64
-	tags graph.Tagger
-
+type allIterator struct {
 	qs    *QuadStore
-	all   []*primitive
+	all   []*Primitive
 	maxid int64 // id of last observed insert (prim id)
 	nodes bool
-
-	i    int // index into qs.all
-	cur  *primitive
-	done bool
 }
 
-func newAllIterator(qs *QuadStore, nodes bool, maxid int64) *AllIterator {
-	return &AllIterator{
-		uid: iterator.NextUID(),
-		qs:  qs, all: qs.cloneAll(), nodes: nodes,
-		i: -1, maxid: maxid,
+func (qs *QuadStore) newAllIterator(nodes bool, maxid int64) *allIterator {
+	return &allIterator{
+		qs: qs, all: qs.cloneAll(), nodes: nodes,
+		maxid: maxid,
 	}
 }
 
-func (it *AllIterator) Clone() graph.Iterator {
-	it2 := newAllIterator(it.qs, it.nodes, it.maxid)
-	it2.tags.CopyFrom(it)
-	return it2
+func (it *allIterator) Iterate() iterator.Scanner {
+	return it.qs.newAllIteratorNext(it.nodes, it.maxid, it.all)
 }
 
-func (it *AllIterator) Reset() {
-	it.i = -1
-	it.cur = nil
-	it.done = false
+func (it *allIterator) Lookup() iterator.Index {
+	return it.qs.newAllIteratorContains(it.nodes, it.maxid)
 }
 
-func (it *AllIterator) ok(p *primitive) bool {
-	if p.ID > it.maxid {
+func (it *allIterator) SubIterators() []iterator.Shape { return nil }
+func (it *allIterator) Optimize(ctx context.Context) (iterator.Shape, bool) {
+	return it, false
+}
+
+func (it *allIterator) String() string {
+	return "MemStoreAll"
+}
+
+func (it *allIterator) Stats(ctx context.Context) (iterator.Costs, error) {
+	return iterator.Costs{
+		NextCost:     1,
+		ContainsCost: 1,
+		Size: refs.Size{
+			// TODO(dennwc): use maxid?
+			Value: int64(len(it.all)),
+			Exact: true,
+		},
+	}, nil
+}
+
+func (p *Primitive) filter(isNode bool, maxid int64) bool {
+	if p.ID > maxid {
 		return false
-	} else if it.nodes && p.Value != nil {
+	} else if isNode && p.Value != nil {
 		return true
-	} else if !it.nodes && !p.Quad.Zero() {
+	} else if !isNode && !p.Quad.Zero() {
 		return true
 	}
 	return false
 }
 
-func (it *AllIterator) Next(ctx context.Context) bool {
+type allIteratorNext struct {
+	qs    *QuadStore
+	all   []*Primitive
+	maxid int64 // id of last observed insert (prim id)
+	nodes bool
+
+	i    int // index into qs.all
+	cur  *Primitive
+	done bool
+}
+
+func (qs *QuadStore) newAllIteratorNext(nodes bool, maxid int64, all []*Primitive) *allIteratorNext {
+	return &allIteratorNext{
+		qs: qs, all: all, nodes: nodes,
+		i: -1, maxid: maxid,
+	}
+}
+
+func (it *allIteratorNext) ok(p *Primitive) bool {
+	return p.filter(it.nodes, it.maxid)
+}
+
+func (it *allIteratorNext) Next(ctx context.Context) bool {
 	it.cur = nil
 	if it.done {
 		return false
@@ -93,7 +125,51 @@ func (it *AllIterator) Next(ctx context.Context) bool {
 	return false
 }
 
-func (it *AllIterator) Contains(ctx context.Context, v graph.Value) bool {
+func (it *allIteratorNext) Result() graph.Ref {
+	if it.cur == nil {
+		return nil
+	}
+	if !it.cur.Quad.Zero() {
+		return qprim{p: it.cur}
+	}
+	return bnode(it.cur.ID)
+}
+
+func (it *allIteratorNext) Err() error { return nil }
+func (it *allIteratorNext) Close() error {
+	it.done = true
+	it.all = nil
+	return nil
+}
+
+func (it *allIteratorNext) TagResults(dst map[string]graph.Ref) {}
+
+func (it *allIteratorNext) String() string {
+	return "MemStoreAllNext"
+}
+func (it *allIteratorNext) NextPath(ctx context.Context) bool { return false }
+
+type allIteratorContains struct {
+	qs    *QuadStore
+	maxid int64 // id of last observed insert (prim id)
+	nodes bool
+
+	cur  *Primitive
+	done bool
+}
+
+func (qs *QuadStore) newAllIteratorContains(nodes bool, maxid int64) *allIteratorContains {
+	return &allIteratorContains{
+		qs: qs, nodes: nodes,
+		maxid: maxid,
+	}
+}
+
+func (it *allIteratorContains) ok(p *Primitive) bool {
+	return p.filter(it.nodes, it.maxid)
+}
+
+func (it *allIteratorContains) Contains(ctx context.Context, v graph.Ref) bool {
 	it.cur = nil
 	if it.done {
 		return false
@@ -112,7 +188,7 @@ func (it *AllIterator) Contains(ctx context.Context, v graph.Value) bool {
 	it.cur = p
 	return true
 }
-func (it *AllIterator) Result() graph.Value {
+func (it *allIteratorContains) Result() graph.Ref {
 	if it.cur == nil {
 		return nil
 	}
@@ -122,38 +198,15 @@ func (it *AllIterator) Result() graph.Value {
 	return bnode(it.cur.ID)
 }
 
-func (it *AllIterator) Err() error { return nil }
-func (it *AllIterator) Close() error {
+func (it *allIteratorContains) Err() error { return nil }
+func (it *allIteratorContains) Close() error {
 	it.done = true
-	it.all = nil
 	return nil
 }
-func (it *AllIterator) Tagger() *graph.Tagger {
-	return &it.tags
-}
 
-func (it *AllIterator) TagResults(dst map[string]graph.Value) {
-	it.tags.TagResult(dst, it.Result())
-}
+func (it *allIteratorContains) TagResults(dst map[string]graph.Ref) {}
 
-func (it *AllIterator) SubIterators() []graph.Iterator   { return nil }
-func (it *AllIterator) Optimize() (graph.Iterator, bool) { return it, false }
-
-func (it *AllIterator) UID() uint64 {
-	return it.uid
+func (it *allIteratorContains) String() string {
+	return "MemStoreAllContains"
 }
-func (it *AllIterator) Type() graph.Type { return graph.All }
-func (it *AllIterator) String() string {
-	return "MemStoreAll"
-}
-func (it *AllIterator) NextPath(ctx context.Context) bool { return false }
-
-func (it *AllIterator) Size() (int64, bool) {
-	// TODO: use maxid?
-	return int64(len(it.all)), true
-}
-func (it *AllIterator) Stats() graph.IteratorStats {
-	st := graph.IteratorStats{NextCost: 1, ContainsCost: 1}
-	st.Size, st.ExactSize = it.Size()
-	return st
-}
+func (it *allIteratorContains) NextPath(ctx context.Context) bool { return false }

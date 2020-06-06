@@ -10,23 +10,26 @@ import (
 	"github.com/cayleygraph/cayley"
 	"github.com/cayleygraph/cayley/graph"
 	_ "github.com/cayleygraph/cayley/graph/kv/bolt"
-	"github.com/cayleygraph/cayley/quad"
+	"github.com/cayleygraph/quad"
 )
 
 func main() {
 	// File for your new BoltDB. Use path to regular file and not temporary in the real world
-	tmpfile, err := ioutil.TempFile("", "example")
+	tmpdir, err := ioutil.TempDir("", "example")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	defer os.Remove(tmpfile.Name()) // clean up
+	defer os.RemoveAll(tmpdir) // clean up
 
 	// Initialize the database
-	graph.InitQuadStore("bolt", tmpfile.Name(), nil)
+	err = graph.InitQuadStore("bolt", tmpdir, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	// Open and use the database
-	store, err := cayley.NewGraph("bolt", tmpfile.Name(), nil)
+	store, err := cayley.NewGraph("bolt", tmpdir, nil)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -39,18 +42,15 @@ func main() {
 	// This is more advanced example of the query.
 	// Simpler equivalent can be found in hello_world example.
 
+	ctx := context.TODO()
 	// Now we get an iterator for the path and optimize it.
 	// The second return is if it was optimized, but we don't care for now.
-	it, _ := p.BuildIterator().Optimize()
-
-	// Optimize iterator on quad store level.
-	// After this step iterators will be replaced with backend-specific ones.
-	it, _ = store.OptimizeIterator(it)
+	its, _ := p.BuildIterator(ctx).Optimize(ctx)
+	it := its.Iterate()
 
 	// remember to cleanup after yourself
 	defer it.Close()
 
-	ctx := context.TODO()
 	// While we have items
 	for it.Next(ctx) {
 		token := it.Result()                // get a ref to a node (backend-specific)
